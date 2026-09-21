@@ -9,7 +9,8 @@ same database and core semantics.
 
 This is a curated public lineage reconstructed from a larger private research repository. It is
 not the original private Git history. See [provenance](docs/provenance.md),
-[capabilities](docs/capabilities.md), and [limitations](docs/limitations.md).
+[capabilities](docs/capabilities.md), [limitations](docs/limitations.md), and the runnable
+[memory lifecycle demo](docs/memory-lifecycle.md).
 
 ## Verify
 
@@ -19,7 +20,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
-The public package version is `0.1.0`; the durable database schema version is `7`.
+The public package version is `0.1.1`; the durable database schema version is `7`.
 
 Task 28 did not establish cross-domain promotion. The evidence workflow remains an explicit,
 bounded contract rather than a general safety or cognition claim.

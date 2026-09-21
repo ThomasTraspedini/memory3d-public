@@ -4,7 +4,15 @@
 
 mod fixture;
 
-use std::{collections::BTreeMap, env, error::Error, fmt, fs, path::PathBuf, process::ExitCode};
+use std::{
+    collections::BTreeMap,
+    env,
+    error::Error,
+    fmt::{self, Write as _},
+    fs,
+    path::PathBuf,
+    process::ExitCode,
+};
 
 use memory3d_core::{
     ActivationOptions, ApplyAuthorization, EvidenceBundle, EvidenceContextItem,
@@ -13,7 +21,7 @@ use memory3d_core::{
 };
 use serde_json::{Value, json};
 
-const HELP: &str = "Memory3D local associative memory\n\nUsage:\n  memory3d-cli [--db PATH] [--json] <COMMAND>\n\nCommands:\n  add --kind KIND --text TEXT [--importance NUMBER]\n  link --source ID --target ID --relation NAME [--weight NUMBER]\n  get --id ID\n  search --query TEXT [--limit NUMBER] [--kind KIND]\n  activate --query TEXT [activation options]\n  feedback --source ID --target ID --relation NAME --kind positive|negative --occurred-at-ms N [--strength NUMBER]\n  evidence preview --bundle PATH\n  evidence apply --bundle PATH --actor IDENTITY --policy IDENTITY\n  evidence get --id EVIDENCE_ID\n  evidence context --query TEXT --scope JSON [activation options] [--candidate-scan-limit N] [--max-bytes N]\n  evidence rollback --idempotency-key KEY\n  info\n  check\n  demo ingest [--replace]\n  demo recall\n\nActivation options:\n  --hops N --seed-limit N --limit N --max-visited-nodes N\n  --max-visited-edges N --include-seeds --feedback-aware\n  --feedback-now-ms N --feedback-half-life-ms N --feedback-candidate-scan-limit N\n\nGlobal options:\n  --db PATH       Database file (default: memory3d.db)\n  --json          Stable machine-readable JSON output\n  -h, --help      Print help\n  -V, --version   Print version\n";
+const HELP: &str = "Memory3D local associative memory\n\nUsage:\n  memory3d-cli [--db PATH] [--json] <COMMAND>\n\nCommands:\n  add --kind KIND --text TEXT [--importance NUMBER]\n  link --source ID --target ID --relation NAME [--weight NUMBER]\n  get --id ID\n  search --query TEXT [--limit NUMBER] [--kind KIND]\n  activate --query TEXT [activation options]\n  feedback --source ID --target ID --relation NAME --kind positive|negative --occurred-at-ms N [--strength NUMBER]\n  evidence preview --bundle PATH\n  evidence apply --bundle PATH --actor IDENTITY --policy IDENTITY\n  evidence get --id EVIDENCE_ID\n  evidence context --query TEXT --scope JSON [activation options] [--candidate-scan-limit N] [--max-bytes N]\n  evidence rollback --idempotency-key KEY\n  info\n  check\n  demo ingest [--replace]\n  demo recall\n  demo lifecycle ingest [--replace]\n  demo lifecycle recall\n\nActivation options:\n  --hops N --seed-limit N --limit N --max-visited-nodes N\n  --max-visited-edges N --include-seeds --feedback-aware\n  --feedback-now-ms N --feedback-half-life-ms N --feedback-candidate-scan-limit N\n\nGlobal options:\n  --db PATH       Database file (default: memory3d.db)\n  --json          Stable machine-readable JSON output\n  -h, --help      Print help\n  -V, --version   Print version\n";
 
 #[derive(Debug)]
 struct CliError(String);
@@ -413,6 +421,41 @@ fn context_item_json(item: &EvidenceContextItem) -> Value {
     })
 }
 
+fn context_package_json(package: &memory3d_core::ContextPackage) -> Value {
+    json!({
+        "query":package.query,
+        "scope":package.scope,
+        "abstained":package.abstained,
+        "estimated_text_bytes":package.estimated_text_bytes,
+        "min_relevance_score":package.min_relevance_score,
+        "candidate_work":package.candidate_work,
+        "ordinary_candidates_skipped":package.ordinary_candidates_skipped,
+        "evidence_candidates_evaluated":package.evidence_candidates_evaluated,
+        "candidate_scan_limit":package.candidate_scan_limit,
+        "result_limit":package.result_limit,
+        "stop_reason":package.stop_reason.as_str(),
+        "traversal":{"seeds":package.traversal.seeds,"visited_nodes":package.traversal.visited_nodes,"visited_edges":package.traversal.visited_edges},
+        "database_work":{"seed_queries":package.database.seed_queries,"seed_node_reads":package.database.seed_node_reads,"adjacency_queries":package.database.adjacency_queries,"traversal_node_reads":package.database.traversal_node_reads},
+        "admitted":package.admitted.iter().map(context_item_json).collect::<Vec<_>>(),
+        "excluded":package.excluded.iter().map(context_item_json).collect::<Vec<_>>()
+    })
+}
+
+fn activation_result_json(result: &memory3d_core::ActivationResult) -> Value {
+    json!({
+        "node":node_json(&result.node),
+        "score":result.score,
+        "hops":result.hops(),
+        "path":{
+            "seed":result.path.seed.get(),
+            "steps":result.path.steps.iter().map(|step|json!({
+                "source":step.source.get(),"relation":step.relation,
+                "weight":step.weight,"target":step.target.get()
+            })).collect::<Vec<_>>()
+        }
+    })
+}
+
 fn info(global: &Global) -> Result<Value, Box<dyn Error>> {
     if !global.args.is_empty() {
         return Err(cli(format!("info takes no options: {:?}", global.args)));
@@ -459,8 +502,120 @@ fn demo(global: &Global) -> Result<Value, Box<dyn Error>> {
                 "demo recall",
             )
         }
+        "lifecycle" => demo_lifecycle(global),
         _ => Err(cli(format!("unknown demo command {subcommand:?}"))),
     }
+}
+
+fn demo_lifecycle(global: &Global) -> Result<Value, Box<dyn Error>> {
+    match global.args.get(1).map(String::as_str) {
+        Some("ingest") => demo_lifecycle_ingest(global),
+        Some("recall") => demo_lifecycle_recall(global),
+        _ => Err(cli("demo lifecycle requires ingest or recall")),
+    }
+}
+
+fn demo_lifecycle_ingest(global: &Global) -> Result<Value, Box<dyn Error>> {
+    let args = &global.args[2..];
+    reject_unknown(args, &[], &["--replace"])?;
+    let replace = flag(args, "--replace");
+    ensure_demo_target_available(&global.db, replace)?;
+    let temp = demo_temp_path(&global.db, "lifecycle-ingest")?;
+    let ingest_result = (|| -> Result<Value, Box<dyn Error>> {
+        let mut repository = Repository::open(&temp)?;
+        let ordinary_nodes = repository.add_nodes(&fixture::lifecycle_nodes()?)?;
+        let authorization =
+            ApplyAuthorization::new(fixture::LIFECYCLE_ACTOR, fixture::LIFECYCLE_POLICY)?;
+        let bundles = fixture::lifecycle_bundles()?;
+        let mut evidence_nodes = BTreeMap::new();
+        let mut bundle_summaries = Vec::new();
+        for bundle in &bundles {
+            let preview = repository.preview_evidence_bundle(bundle)?;
+            let report = repository.apply_evidence_bundle(bundle, &authorization)?;
+            for item in &report.items {
+                evidence_nodes.insert(item.evidence_id.clone(), item.node_id);
+            }
+            bundle_summaries.push(json!({
+                "idempotency_key":report.idempotency_key,
+                "preview_status":preview.status.as_str(),
+                "evidence_items":report.items.len(),
+                "replayed":report.replayed
+            }));
+        }
+        let relations = fixture::lifecycle_relations(&ordinary_nodes, &evidence_nodes)?;
+        repository.add_relations(&relations)?;
+        Ok(json!({
+            "ordinary_nodes":ordinary_nodes.len(),
+            "evidence_items":evidence_nodes.len(),
+            "node_count":repository.list_nodes()?.len(),
+            "relation_count":repository.list_relations()?.len(),
+            "authorization":{"actor":authorization.actor(),"policy":authorization.policy()},
+            "bundles":bundle_summaries
+        }))
+    })();
+    let summary = finish_demo_ingest(&temp, &global.db, ingest_result)?;
+    Ok(json!({
+        "command":"demo lifecycle ingest",
+        "database":global.db,
+        "replaced":replace,
+        "ordinary_nodes":summary["ordinary_nodes"],
+        "evidence_items":summary["evidence_items"],
+        "node_count":summary["node_count"],
+        "relation_count":summary["relation_count"],
+        "authorization":summary["authorization"],
+        "bundles":summary["bundles"]
+    }))
+}
+
+fn demo_lifecycle_recall(global: &Global) -> Result<Value, Box<dyn Error>> {
+    if global.args.len() != 2 {
+        return Err(cli("demo lifecycle recall takes no options"));
+    }
+    let repository = Repository::open(&global.db)?;
+    let node_count = repository.list_nodes()?.len();
+    let relation_count = repository.list_relations()?.len();
+    let evidence_items_present = fixture::LIFECYCLE_EVIDENCE_IDS
+        .iter()
+        .map(|id| repository.get_evidence_item(id))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .count();
+    let activation = repository.activate(
+        fixture::LIFECYCLE_QUERY,
+        &fixture::lifecycle_activation_options(),
+    )?;
+    let associative = activation
+        .results
+        .iter()
+        .find(|result| result.node.kind().as_str() == "environment")
+        .ok_or_else(|| cli("lifecycle fixture is missing its associative environment result"))?;
+    let settled = repository.assemble_evidence_context(
+        fixture::LIFECYCLE_QUERY,
+        &fixture::lifecycle_context_options("bedroom", 8)?,
+    )?;
+    let conflict = repository.assemble_evidence_context(
+        fixture::CONFLICT_QUERY,
+        &fixture::lifecycle_context_options("bedroom", 4)?,
+    )?;
+    Ok(json!({
+        "command":"demo lifecycle recall",
+        "database":global.db,
+        "persistence":{
+            "node_count":node_count,
+            "relation_count":relation_count,
+            "expected_evidence_items":fixture::LIFECYCLE_EVIDENCE_IDS.len(),
+            "evidence_items_present":evidence_items_present
+        },
+        "associative_retrieval":{
+            "query":fixture::LIFECYCLE_QUERY,
+            "result":activation_result_json(associative),
+            "traversal":{"seeds":activation.stats.seeds,"visited_nodes":activation.stats.visited_nodes,"visited_edges":activation.stats.visited_edges},
+            "bounds":{"max_visited_nodes":16,"max_visited_edges":16}
+        },
+        "settled_context":context_package_json(&settled),
+        "conflict_context":context_package_json(&conflict)
+    }))
 }
 
 fn demo_ingest(global: &Global) -> Result<Value, Box<dyn Error>> {
@@ -513,6 +668,56 @@ fn demo_ingest(global: &Global) -> Result<Value, Box<dyn Error>> {
         "relation_count":relation_count,
         "replaced":replace
     }))
+}
+
+fn ensure_demo_target_available(
+    path: &std::path::Path,
+    replace: bool,
+) -> Result<(), Box<dyn Error>> {
+    if path.exists() && !replace {
+        let existing = Repository::open(path)?;
+        if !existing.list_nodes()?.is_empty() || !existing.list_relations()?.is_empty() {
+            return Err(cli(format!(
+                "database {} is populated; pass --replace to replace it explicitly",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn demo_temp_path(path: &std::path::Path, label: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| cli("database path must name a file"))?
+        .to_string_lossy();
+    let temp = parent.join(format!(".{file_name}.{label}-{}", std::process::id()));
+    if temp.exists() {
+        fs::remove_file(&temp)?;
+    }
+    Ok(temp)
+}
+
+fn finish_demo_ingest(
+    temp: &std::path::Path,
+    destination: &std::path::Path,
+    result: Result<Value, Box<dyn Error>>,
+) -> Result<Value, Box<dyn Error>> {
+    match result {
+        Ok(summary) => {
+            fs::rename(temp, destination)?;
+            Ok(summary)
+        }
+        Err(error) => {
+            let _ = fs::remove_file(temp);
+            Err(error)
+        }
+    }
 }
 
 fn activation_json(
@@ -704,6 +909,17 @@ fn print_output(value: &Value, json_mode: bool) -> Result<(), Box<dyn Error>> {
 
 fn human_output(value: &Value) -> String {
     match value.get("command").and_then(Value::as_str) {
+        Some("demo lifecycle ingest") => format!(
+            "Memory3D lifecycle ingest\nDatabase: {}\nPersisted: {} nodes, {} relations\nEvidence: {} items in {} authorized bundles\nAuthorization: actor={} policy={}\nNext: reopen this database in a separate process with `demo lifecycle recall`",
+            value["database"].as_str().unwrap_or("?"),
+            value["node_count"],
+            value["relation_count"],
+            value["evidence_items"],
+            value["bundles"].as_array().map_or(0, Vec::len),
+            value["authorization"]["actor"].as_str().unwrap_or("?"),
+            value["authorization"]["policy"].as_str().unwrap_or("?")
+        ),
+        Some("demo lifecycle recall") => lifecycle_recall_human(value),
         Some("demo ingest" | "info") => format!(
             "Database: {}\nNodes: {}\nRelations: {}",
             value["database"].as_str().unwrap_or("?"),
@@ -754,6 +970,135 @@ fn human_output(value: &Value) -> String {
         }
         _ => serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
     }
+}
+
+fn lifecycle_recall_human(value: &Value) -> String {
+    let associative = &value["associative_retrieval"];
+    let result = &associative["result"];
+    let mut lines = vec![
+        "Memory3D lifecycle recall".to_owned(),
+        format!(
+            "Database reopened: {}",
+            value["database"].as_str().unwrap_or("?")
+        ),
+        format!(
+            "Persisted: {} nodes, {} relations, {}/{} expected evidence items present",
+            value["persistence"]["node_count"],
+            value["persistence"]["relation_count"],
+            value["persistence"]["evidence_items_present"],
+            value["persistence"]["expected_evidence_items"]
+        ),
+        String::new(),
+        "ASSOCIATIVE RETRIEVAL".to_owned(),
+        format!("query: {}", associative["query"].as_str().unwrap_or("?")),
+        format!(
+            "found: {} (score={:.3})",
+            result["node"]["text"].as_str().unwrap_or("?"),
+            result["score"].as_f64().unwrap_or(0.0)
+        ),
+        format!("path: {}", path_human(&result["path"])),
+        format!(
+            "traversal: nodes={}/{} edges={}/{}",
+            associative["traversal"]["visited_nodes"],
+            associative["bounds"]["max_visited_nodes"],
+            associative["traversal"]["visited_edges"],
+            associative["bounds"]["max_visited_edges"]
+        ),
+        String::new(),
+        "SETTLED EVIDENCE".to_owned(),
+    ];
+    append_context_human(&mut lines, &value["settled_context"]);
+    lines.push(String::new());
+    lines.push("UNRESOLVED CONFLICT".to_owned());
+    append_context_human(&mut lines, &value["conflict_context"]);
+    lines.join("\n")
+}
+
+fn append_context_human(lines: &mut Vec<String>, context: &Value) {
+    lines.push(format!(
+        "query: {}",
+        context["query"].as_str().unwrap_or("?")
+    ));
+    lines.push("admitted:".to_owned());
+    append_evidence_items(lines, &context["admitted"], false);
+    lines.push("excluded:".to_owned());
+    append_evidence_items(lines, &context["excluded"], true);
+    lines.push(format!("abstained: {}", context["abstained"]));
+    lines.push(format!(
+        "candidate scan: {}/{} inspected; evidence={} ordinary_skipped={}; admitted={}/{}; stop={}",
+        context["candidate_work"],
+        context["candidate_scan_limit"],
+        context["evidence_candidates_evaluated"],
+        context["ordinary_candidates_skipped"],
+        context["admitted"].as_array().map_or(0, Vec::len),
+        context["result_limit"],
+        context["stop_reason"].as_str().unwrap_or("?")
+    ));
+}
+
+fn append_evidence_items(lines: &mut Vec<String>, items: &Value, show_exclusion: bool) {
+    let Some(items) = items.as_array() else {
+        lines.push("  (none)".to_owned());
+        return;
+    };
+    if items.is_empty() {
+        lines.push("  (none)".to_owned());
+    }
+    for item in items {
+        let evidence = &item["evidence"];
+        let status = if show_exclusion {
+            format!(
+                " reason={}{}{}",
+                item["exclusion"].as_str().unwrap_or("?"),
+                list_suffix(" superseded_by=", &item["superseded_by"]),
+                list_suffix(" conflicts=", &item["conflicts"])
+            )
+        } else {
+            format!(
+                " lifecycle={}",
+                evidence["lifecycle"].as_str().unwrap_or("?")
+            )
+        };
+        lines.push(format!(
+            "  {}{} score={:.3} path={}",
+            evidence["id"].as_str().unwrap_or("?"),
+            status,
+            item["relevance_score"].as_f64().unwrap_or(0.0),
+            path_human(&item["path"])
+        ));
+    }
+}
+
+fn list_suffix(prefix: &str, value: &Value) -> String {
+    value.as_array().map_or_else(String::new, |items| {
+        if items.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "{prefix}[{}]",
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
+    })
+}
+
+fn path_human(path: &Value) -> String {
+    let mut rendered = path["seed"].to_string();
+    if let Some(steps) = path["steps"].as_array() {
+        for step in steps {
+            let _ = write!(
+                rendered,
+                " -[{}]-> {}",
+                step["relation"].as_str().unwrap_or("?"),
+                step["target"]
+            );
+        }
+    }
+    rendered
 }
 
 fn cli(message: impl Into<String>) -> Box<dyn Error> {

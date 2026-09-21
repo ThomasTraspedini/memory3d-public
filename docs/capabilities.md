@@ -17,5 +17,5 @@ Experimental/core-only capability:
   avoid schema and migration divergence, is never selected by default, and is not exposed as a
   promoted adapter workflow.
 
-Not included in version 0.1.0: embeddings, pruning, spatial retrieval, synthesis, binary payloads,
+Not included in version 0.1.1: embeddings, pruning, spatial retrieval, synthesis, binary payloads,
 automatic extraction, model execution, background lifecycle changes, or a custom storage engine.

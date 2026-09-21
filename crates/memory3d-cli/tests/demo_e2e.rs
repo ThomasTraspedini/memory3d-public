@@ -35,6 +35,23 @@ fn run_failure(path: &Path, arguments: &[&str]) -> Result<String, Box<dyn Error>
     Ok(String::from_utf8(output.stderr)?)
 }
 
+fn evidence_ids(items: &Value) -> Result<Vec<&str>, Box<dyn Error>> {
+    Ok(items
+        .as_array()
+        .ok_or("evidence items are not an array")?
+        .iter()
+        .map(|item| item["evidence"]["id"].as_str().ok_or("missing evidence ID"))
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+fn exclusion_for<'a>(items: &'a Value, id: &str) -> Option<&'a str> {
+    items.as_array()?.iter().find_map(|item| {
+        (item["evidence"]["id"] == id)
+            .then(|| item["exclusion"].as_str())
+            .flatten()
+    })
+}
+
 #[test]
 fn ingest_and_recall_are_durable_deterministic_separate_processes() -> TestResult {
     let directory = tempdir()?;
@@ -139,6 +156,155 @@ fn ingest_and_recall_are_durable_deterministic_separate_processes() -> TestResul
     assert!(missing_error.contains("does not exist"));
     let malformed_error = run_failure(&path, &["activate", "--query", "token", "--hops", "99"])?;
     assert!(malformed_error.contains("hops must be between"));
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn lifecycle_demo_reopens_with_paths_exclusions_conflict_abstention_and_bounds() -> TestResult {
+    let directory = tempdir()?;
+    let path = directory.path().join("lifecycle.memory3d");
+
+    let ingest = run_json(&path, &["demo", "lifecycle", "ingest"])?;
+    assert!(path.is_file());
+    assert_eq!(ingest["ordinary_nodes"], 3);
+    assert_eq!(ingest["evidence_items"], 8);
+    assert_eq!(ingest["bundles"].as_array().map(Vec::len), Some(3));
+    assert_eq!(
+        ingest["authorization"]["policy"],
+        "manual-environment-review-v1"
+    );
+    assert!(ingest["bundles"].as_array().is_some_and(|bundles| {
+        bundles
+            .iter()
+            .all(|bundle| bundle["preview_status"] == "new" && bundle["replayed"] == false)
+    }));
+
+    let bytes_after_ingest = fs::read(&path)?;
+    let recall = run_json(&path, &["demo", "lifecycle", "recall"])?;
+    assert_eq!(bytes_after_ingest, fs::read(&path)?);
+    assert_eq!(recall["persistence"]["node_count"], ingest["node_count"]);
+    assert_eq!(
+        recall["persistence"]["relation_count"],
+        ingest["relation_count"]
+    );
+    assert_eq!(recall["persistence"]["evidence_items_present"], 8);
+
+    let associative = &recall["associative_retrieval"];
+    assert_eq!(associative["result"]["node"]["kind"], "environment");
+    assert_eq!(associative["result"]["hops"], 1);
+    assert_eq!(
+        associative["result"]["path"]["steps"][0]["relation"],
+        "connects_to"
+    );
+    assert_eq!(
+        associative["result"]["path"]["steps"][0]["target"],
+        associative["result"]["node"]["id"]
+    );
+    assert!(
+        associative["traversal"]["visited_nodes"]
+            .as_u64()
+            .unwrap_or(u64::MAX)
+            <= associative["bounds"]["max_visited_nodes"]
+                .as_u64()
+                .unwrap_or_default()
+    );
+    assert!(
+        associative["traversal"]["visited_edges"]
+            .as_u64()
+            .unwrap_or(u64::MAX)
+            <= associative["bounds"]["max_visited_edges"]
+                .as_u64()
+                .unwrap_or_default()
+    );
+
+    let settled = &recall["settled_context"];
+    let admitted = evidence_ids(&settled["admitted"])?;
+    assert!(admitted.contains(&"bedroom-calibrated-normal-v2"));
+    assert!(admitted.contains(&"bedroom-monitor-v2"));
+    assert_eq!(
+        exclusion_for(&settled["excluded"], "bedroom-high-v1"),
+        Some("superseded")
+    );
+    assert_eq!(
+        exclusion_for(&settled["excluded"], "bedroom-inspect-v1"),
+        Some("superseded")
+    );
+    assert_eq!(
+        exclusion_for(&settled["excluded"], "nursery-high-v1"),
+        Some("scope_mismatch")
+    );
+    assert_eq!(settled["abstained"], false);
+    assert_eq!(settled["candidate_scan_limit"], 8);
+    assert_eq!(settled["candidate_work"], 8);
+    assert_eq!(settled["evidence_candidates_evaluated"], 6);
+    assert_eq!(settled["ordinary_candidates_skipped"], 2);
+    assert_eq!(settled["stop_reason"], "candidate_stream_exhausted");
+    for item in settled["admitted"]
+        .as_array()
+        .ok_or("admitted is not an array")?
+    {
+        let steps = item["path"]["steps"]
+            .as_array()
+            .ok_or("missing evidence path")?;
+        assert!(!steps.is_empty());
+        assert_eq!(
+            steps.last().ok_or("empty evidence path")?["target"],
+            item["evidence"]["node"]["id"]
+        );
+    }
+
+    let conflict = &recall["conflict_context"];
+    assert_eq!(conflict["abstained"], true);
+    assert!(conflict["admitted"].as_array().is_some_and(Vec::is_empty));
+    assert_eq!(conflict["candidate_scan_limit"], 4);
+    assert_eq!(conflict["candidate_work"], 4);
+    assert_eq!(conflict["evidence_candidates_evaluated"], 2);
+    assert_eq!(conflict["ordinary_candidates_skipped"], 2);
+    assert_eq!(
+        exclusion_for(&conflict["excluded"], "bedroom-ventilation-closed-v1"),
+        Some("conflict")
+    );
+    assert_eq!(
+        exclusion_for(&conflict["excluded"], "bedroom-ventilation-open-v1"),
+        Some("conflict")
+    );
+    assert!(conflict["excluded"].as_array().is_some_and(|items| {
+        items.iter().all(|item| {
+            item["conflicts"]
+                .as_array()
+                .is_some_and(|ids| !ids.is_empty())
+        })
+    }));
+
+    let human = Command::new(env!("CARGO_BIN_EXE_memory3d-cli"))
+        .args([
+            "--db",
+            path.to_str().ok_or("non-UTF-8 test path")?,
+            "demo",
+            "lifecycle",
+            "recall",
+        ])
+        .output()?;
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout)?;
+    for label in [
+        "Database reopened:",
+        "ASSOCIATIVE RETRIEVAL",
+        "path:",
+        "admitted:",
+        "excluded:",
+        "reason=superseded",
+        "reason=scope_mismatch",
+        "reason=conflict",
+        "abstained: true",
+        "candidate scan:",
+    ] {
+        assert!(
+            human.contains(label),
+            "missing human-output label {label:?}"
+        );
+    }
     Ok(())
 }
 
