@@ -779,7 +779,7 @@ fn parse_args() -> Result<Option<PathBuf>, Box<dyn Error>> {
 }
 
 fn duration_micros(duration: std::time::Duration) -> u64 {
-    u64::try_from(duration.as_micros()).map_or(u64::MAX, |value| value)
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 const MAX_KIND_BYTES: usize = memory3d_core::MAX_KIND_BYTES;

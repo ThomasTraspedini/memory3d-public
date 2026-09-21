@@ -561,7 +561,7 @@ fn json_to_python(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> {
 }
 
 fn duration_micros(duration: std::time::Duration) -> u64 {
-    u64::try_from(duration.as_micros()).map_or(u64::MAX, |value| value)
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 /// Python bindings for `Memory3D`.
