@@ -232,3 +232,219 @@ fn general_commands_cover_the_persistent_adapter_surface() -> TestResult {
     assert_eq!(info["relation_count"], 1);
     Ok(())
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn evidence_commands_share_preview_apply_context_get_and_rollback_core_behavior() -> TestResult {
+    let directory = tempdir()?;
+    let path = directory.path().join("evidence-cli.memory3d");
+    let bundle_path = directory.path().join("bundle.json");
+    fs::write(
+        &bundle_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version":1,
+            "idempotency_key":"cli-evidence-v1",
+            "items":[{
+                "id":"cli-filesystem-offset",
+                "kind":"decision",
+                "text":"Filesystem checkpoints use BYTE_OFFSET.",
+                "source":"runbook:filesystem",
+                "producer":"operator:cli-test",
+                "scope":{"environment":"production","transport":"filesystem"},
+                "lifecycle":"approved",
+                "created_at_ms":1_700_000_000_000_i64,
+                "decision":{
+                    "actor":"operator:cli-test",
+                    "policy":"manual-review-v1",
+                    "decided_at_ms":1_700_000_000_100_i64
+                }
+            }]
+        }))?,
+    )?;
+    let bundle = bundle_path.to_str().ok_or("non-UTF-8 bundle path")?;
+    let preview = run_json(&path, &["evidence", "preview", "--bundle", bundle])?;
+    assert_eq!(preview["status"], "new");
+    assert_eq!(preview["projected_nodes"], 1);
+
+    let applied = run_json(
+        &path,
+        &[
+            "evidence",
+            "apply",
+            "--bundle",
+            bundle,
+            "--actor",
+            "operator:cli-test",
+            "--policy",
+            "manual-review-v1",
+        ],
+    )?;
+    assert_eq!(applied["replayed"], false);
+    let replay = run_json(
+        &path,
+        &[
+            "evidence",
+            "apply",
+            "--bundle",
+            bundle,
+            "--actor",
+            "operator:cli-test",
+            "--policy",
+            "manual-review-v1",
+        ],
+    )?;
+    assert_eq!(replay["replayed"], true);
+
+    let stored = run_json(&path, &["evidence", "get", "--id", "cli-filesystem-offset"])?;
+    assert_eq!(stored["evidence"]["lifecycle"], "approved");
+    assert_eq!(stored["evidence"]["source"], "runbook:filesystem");
+
+    let context = run_json(
+        &path,
+        &[
+            "evidence",
+            "context",
+            "--query",
+            "filesystem checkpoint offset",
+            "--scope",
+            r#"{"environment":"production","transport":"filesystem"}"#,
+            "--candidate-scan-limit",
+            "1",
+        ],
+    )?;
+    assert_eq!(context["abstained"], false);
+    assert_eq!(context["candidate_scan_limit"], 1);
+    assert_eq!(context["result_limit"], 10);
+    assert_eq!(context["candidate_work"], 1);
+    assert_eq!(context["evidence_candidates_evaluated"], 1);
+    assert_eq!(context["ordinary_candidates_skipped"], 0);
+    assert_eq!(context["stop_reason"], "candidate_stream_exhausted");
+    assert_eq!(
+        context["admitted"][0]["evidence"]["id"],
+        "cli-filesystem-offset"
+    );
+    assert_eq!(
+        context["admitted"][0]["selection_provenance"],
+        "bounded_lexical_seed_and_graph_activation"
+    );
+
+    let rollback = run_json(
+        &path,
+        &[
+            "evidence",
+            "rollback",
+            "--idempotency-key",
+            "cli-evidence-v1",
+        ],
+    )?;
+    assert_eq!(rollback["removed_items"], 1);
+    assert!(
+        run_failure(&path, &["evidence", "get", "--id", "cli-filesystem-offset"])?
+            .contains("does not exist")
+    );
+    Ok(())
+}
+
+#[test]
+fn cli_feedback_event_changes_explicit_feedback_aware_activation() -> TestResult {
+    let directory = tempdir()?;
+    let path = directory.path().join("feedback.memory3d");
+    let seed = run_json(
+        &path,
+        &[
+            "add",
+            "--kind",
+            "component",
+            "--text",
+            "Feedback probe component",
+            "--importance",
+            "1",
+        ],
+    )?;
+    let baseline = run_json(
+        &path,
+        &["add", "--kind", "evidence", "--text", "Baseline evidence"],
+    )?;
+    let boosted = run_json(
+        &path,
+        &["add", "--kind", "evidence", "--text", "Boosted evidence"],
+    )?;
+    let seed_id = seed["node"]["id"].as_u64().ok_or("seed ID")?;
+    let baseline_id = baseline["node"]["id"].as_u64().ok_or("baseline ID")?;
+    let boosted_id = boosted["node"]["id"].as_u64().ok_or("boosted ID")?;
+    for (target, weight) in [(baseline_id, "0.6"), (boosted_id, "0.5")] {
+        run_json(
+            &path,
+            &[
+                "link",
+                "--source",
+                &seed_id.to_string(),
+                "--target",
+                &target.to_string(),
+                "--relation",
+                "reveals",
+                "--weight",
+                weight,
+            ],
+        )?;
+    }
+
+    let tight_args = [
+        "activate",
+        "--query",
+        "feedback probe",
+        "--seed-limit",
+        "1",
+        "--limit",
+        "1",
+        "--max-visited-nodes",
+        "2",
+        "--max-visited-edges",
+        "1",
+    ];
+    let plain = run_json(&path, &tight_args)?;
+    assert_eq!(plain["results"][0]["node"]["id"], baseline_id);
+
+    let event = run_json(
+        &path,
+        &[
+            "feedback",
+            "--source",
+            &seed_id.to_string(),
+            "--target",
+            &boosted_id.to_string(),
+            "--relation",
+            "reveals",
+            "--kind",
+            "positive",
+            "--occurred-at-ms",
+            "1000",
+        ],
+    )?;
+    assert_eq!(event["event"]["kind"], "positive");
+    assert_eq!(event["event"]["target"], boosted_id);
+
+    let feedback = run_json(
+        &path,
+        &[
+            "activate",
+            "--query",
+            "feedback probe",
+            "--seed-limit",
+            "1",
+            "--limit",
+            "1",
+            "--max-visited-nodes",
+            "2",
+            "--max-visited-edges",
+            "1",
+            "--feedback-aware",
+        ],
+    )?;
+    assert_eq!(feedback["results"][0]["node"]["id"], boosted_id);
+    assert_eq!(
+        feedback["options"]["feedback_policy"]["name"],
+        "explicit-feedback-v1"
+    );
+    Ok(())
+}

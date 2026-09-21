@@ -132,7 +132,19 @@ fn stdio_server_reopens_database_and_matches_core_activation() -> TestResult {
         .collect::<Result<Vec<_>, _>>()?;
     assert_eq!(
         tool_names,
-        vec!["activate", "add", "get", "health", "link", "search"]
+        vec![
+            "activate",
+            "add",
+            "evidence_apply",
+            "evidence_context",
+            "evidence_get",
+            "evidence_preview",
+            "evidence_rollback",
+            "get",
+            "health",
+            "link",
+            "search"
+        ]
     );
     let add_schema = tools["result"]["tools"]
         .as_array()
@@ -241,6 +253,109 @@ fn stdio_server_reopens_database_and_matches_core_activation() -> TestResult {
         activation["stats"]["visited_edges"],
         core.stats.visited_edges
     );
+    second.stop()?;
+    Ok(())
+}
+
+#[test]
+fn evidence_tools_match_core_context_and_persist_across_server_reopen() -> TestResult {
+    let directory = tempdir()?;
+    let database = directory.path().join("evidence-mcp.memory3d");
+    let bundle_json = serde_json::to_string(&json!({
+        "version":1,
+        "idempotency_key":"mcp-evidence-v1",
+        "items":[{
+            "id":"mcp-filesystem-offset",
+            "kind":"decision",
+            "text":"Filesystem checkpoints use BYTE_OFFSET.",
+            "source":"runbook:filesystem",
+            "producer":"operator:mcp-test",
+            "scope":{"environment":"production","transport":"filesystem"},
+            "lifecycle":"approved",
+            "created_at_ms":1_700_000_000_000_i64,
+            "decision":{
+                "actor":"operator:mcp-test",
+                "policy":"manual-review-v1",
+                "decided_at_ms":1_700_000_000_100_i64
+            }
+        }]
+    }))?;
+    let mut first = McpSession::start(&database)?;
+    let preview = first.call_tool("evidence_preview", &json!({"bundle_json":bundle_json}))?;
+    assert_eq!(preview["status"], "new");
+    let applied = first.call_tool(
+        "evidence_apply",
+        &json!({
+            "bundle_json":bundle_json,
+            "actor":"operator:mcp-test",
+            "policy":"manual-review-v1"
+        }),
+    )?;
+    assert_eq!(applied["replayed"], false);
+    first.stop()?;
+
+    let scope = std::collections::BTreeMap::from([
+        ("environment".to_owned(), "production".to_owned()),
+        ("transport".to_owned(), "filesystem".to_owned()),
+    ]);
+    let repository = Repository::open(&database)?;
+    let core = repository.assemble_evidence_context(
+        "filesystem checkpoint offset",
+        &memory3d_core::EvidenceContextOptions::settled(scope.clone())?,
+    )?;
+    assert_eq!(core.admitted.len(), 1);
+    drop(repository);
+
+    let mut second = McpSession::start(&database)?;
+    let stored = second.call_tool(
+        "evidence_get",
+        &json!({"evidence_id":"mcp-filesystem-offset"}),
+    )?;
+    assert_eq!(stored["evidence"]["lifecycle"], "approved");
+    let context = second.call_tool(
+        "evidence_context",
+        &json!({
+            "query":"filesystem checkpoint offset",
+            "scope":scope,
+            "candidate_scan_limit":1
+        }),
+    )?;
+    assert_eq!(context["abstained"], core.abstained);
+    assert_eq!(context["candidate_work"], core.candidate_work);
+    assert_eq!(context["candidate_scan_limit"], 1);
+    assert_eq!(context["result_limit"], 10);
+    assert_eq!(context["ordinary_candidates_skipped"], 0);
+    assert_eq!(context["evidence_candidates_evaluated"], 1);
+    assert_eq!(context["stop_reason"], "candidate_stream_exhausted");
+    assert_eq!(
+        context["traversal"]["visited_nodes"],
+        core.traversal.visited_nodes
+    );
+    assert_eq!(
+        context["admitted"][0]["evidence"]["id"],
+        core.admitted[0].stored.evidence.id()
+    );
+
+    let mismatch = second.call_tool(
+        "evidence_context",
+        &json!({
+            "query":"filesystem checkpoint offset",
+            "scope":{"environment":"production","transport":"kafka"}
+        }),
+    )?;
+    assert_eq!(mismatch["abstained"], true);
+    assert_eq!(mismatch["excluded"][0]["exclusion"], "scope_mismatch");
+
+    let rollback = second.call_tool(
+        "evidence_rollback",
+        &json!({"idempotency_key":"mcp-evidence-v1"}),
+    )?;
+    assert_eq!(rollback["removed_items"], 1);
+    let missing = second.call_tool(
+        "evidence_get",
+        &json!({"evidence_id":"mcp-filesystem-offset"}),
+    )?;
+    assert!(missing["evidence"].is_null());
     second.stop()?;
     Ok(())
 }

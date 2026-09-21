@@ -515,13 +515,25 @@ fn py_validation_error(value: memory3d_core::ValidationError) -> PyErr {
 fn py_repository_error(value: RepositoryError) -> PyErr {
     match value {
         RepositoryError::Validation(error) => ValidationError::new_err(error.to_string()),
-        RepositoryError::Busy => BusyError::new_err(value.to_string()),
-        RepositoryError::NodeNotFound(_) | RepositoryError::RelationNotFound { .. } => {
-            NotFoundError::new_err(value.to_string())
+        RepositoryError::Evidence(_)
+        | RepositoryError::EvidenceIdExists(_)
+        | RepositoryError::EvidenceReferenceNotFound { .. }
+        | RepositoryError::EvidenceConflictGroupMismatch { .. }
+        | RepositoryError::IdempotencyConflict(_)
+        | RepositoryError::EvidenceBundleRolledBack(_)
+        | RepositoryError::EvidenceRollbackBlocked { .. } => {
+            ValidationError::new_err(value.to_string())
         }
+        RepositoryError::Busy => BusyError::new_err(value.to_string()),
+        RepositoryError::NodeNotFound(_)
+        | RepositoryError::RelationNotFound { .. }
+        | RepositoryError::FeedbackEventNotFound(_)
+        | RepositoryError::EvidenceBundleNotFound(_) => NotFoundError::new_err(value.to_string()),
         RepositoryError::Database(_)
         | RepositoryError::InvalidDatabase(_)
         | RepositoryError::UnsupportedSchema { .. }
+        | RepositoryError::CommunityArtifactsMissing
+        | RepositoryError::CommunityArtifactsStale { .. }
         | RepositoryError::Clock(_) => DatabaseError::new_err(value.to_string()),
     }
 }

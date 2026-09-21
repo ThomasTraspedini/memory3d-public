@@ -8,12 +8,14 @@ use std::{
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, ffi::ErrorCode, params};
 
 use crate::{
-    Coordinates, MAX_RELATION_NAME_BYTES, MemoryKind, MemoryNode, Metadata, NewMemory, NewRelation,
-    NodeId, Relation, ValidationError, normalize_terms, validate_string, validate_unit_interval,
+    Coordinates, EvidenceError, FeedbackEvent, FeedbackEventId, FeedbackKind,
+    MAX_RELATION_NAME_BYTES, MemoryKind, MemoryNode, Metadata, NewFeedbackEvent, NewMemory,
+    NewRelation, NodeId, Relation, ValidationError, normalize_terms, validate_string,
+    validate_unit_interval,
 };
 
 const FORMAT_ID: &str = "memory3d";
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 7;
 const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
 const CREATE_SCHEMA_V1: &str = r"
@@ -33,9 +35,9 @@ CREATE TABLE nodes (
     z REAL,
     CHECK ((x IS NULL AND y IS NULL AND z IS NULL) OR
            (x IS NOT NULL AND y IS NOT NULL AND z IS NOT NULL)),
-    CHECK (x IS NULL OR (x >= -1.7976931348623157e308 AND x <= 1.7976931348623157e308)),
-    CHECK (y IS NULL OR (y >= -1.7976931348623157e308 AND y <= 1.7976931348623157e308)),
-    CHECK (z IS NULL OR (z >= -1.7976931348623157e308 AND z <= 1.7976931348623157e308))
+    CHECK (x IS NULL OR (typeof(x) = 'real' AND x >= -1000000.0 AND x <= 1000000.0)),
+    CHECK (y IS NULL OR (typeof(y) = 'real' AND y >= -1000000.0 AND y <= 1000000.0)),
+    CHECK (z IS NULL OR (typeof(z) = 'real' AND z >= -1000000.0 AND z <= 1000000.0))
 );
 
 CREATE TABLE relations (
@@ -69,6 +71,174 @@ const CREATE_SCHEMA_V3: &str = r"
 CREATE INDEX relations_adjacency_idx ON relations(source_id, weight DESC);
 ";
 
+const CREATE_SCHEMA_V4: &str = r"
+CREATE TABLE relation_feedback_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK (id > 0),
+    source_id INTEGER NOT NULL,
+    target_id INTEGER NOT NULL,
+    relation_name TEXT NOT NULL CHECK (
+        length(trim(relation_name)) > 0 AND length(CAST(relation_name AS BLOB)) <= 64
+    ),
+    kind TEXT NOT NULL CHECK (kind IN ('positive', 'negative')),
+    strength REAL NOT NULL CHECK (strength > 0.0 AND strength <= 1.0),
+    occurred_at_ms INTEGER NOT NULL CHECK (occurred_at_ms >= 0),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    FOREIGN KEY (source_id, target_id, relation_name)
+        REFERENCES relations(source_id, target_id, name) ON DELETE RESTRICT
+);
+
+CREATE INDEX relation_feedback_relation_idx
+    ON relation_feedback_events(source_id, target_id, relation_name, occurred_at_ms, id);
+";
+
+const CREATE_SCHEMA_V5: &str = r"
+CREATE TABLE community_graph_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    graph_revision INTEGER NOT NULL CHECK (graph_revision >= 0)
+);
+INSERT INTO community_graph_state (singleton, graph_revision) VALUES (1, 0);
+
+CREATE TABLE community_builds (
+    policy TEXT PRIMARY KEY,
+    graph_revision INTEGER NOT NULL CHECK (graph_revision >= 0),
+    built_at_ms INTEGER NOT NULL CHECK (built_at_ms >= 0),
+    fine_threshold REAL NOT NULL CHECK (fine_threshold >= 0.0 AND fine_threshold <= 1.0),
+    coarse_threshold REAL NOT NULL CHECK (coarse_threshold >= 0.0 AND coarse_threshold <= 1.0),
+    build_node_work INTEGER NOT NULL CHECK (build_node_work >= 0),
+    build_edge_work INTEGER NOT NULL CHECK (build_edge_work >= 0)
+);
+
+CREATE TABLE community_memberships (
+    policy TEXT NOT NULL REFERENCES community_builds(policy) ON DELETE CASCADE,
+    resolution INTEGER NOT NULL CHECK (resolution IN (0, 1)),
+    community_id INTEGER NOT NULL CHECK (community_id > 0),
+    node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    PRIMARY KEY (policy, resolution, node_id)
+);
+CREATE INDEX community_memberships_lookup_idx
+    ON community_memberships(policy, resolution, community_id, node_id);
+
+CREATE TRIGGER community_nodes_insert_revision
+AFTER INSERT ON nodes BEGIN
+    UPDATE community_graph_state SET graph_revision = graph_revision + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER community_nodes_update_revision
+AFTER UPDATE ON nodes BEGIN
+    UPDATE community_graph_state SET graph_revision = graph_revision + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER community_nodes_delete_revision
+AFTER DELETE ON nodes BEGIN
+    UPDATE community_graph_state SET graph_revision = graph_revision + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER community_relations_insert_revision
+AFTER INSERT ON relations BEGIN
+    UPDATE community_graph_state SET graph_revision = graph_revision + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER community_relations_update_revision
+AFTER UPDATE OF source_id, target_id, name, weight ON relations BEGIN
+    UPDATE community_graph_state SET graph_revision = graph_revision + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER community_relations_delete_revision
+AFTER DELETE ON relations BEGIN
+    UPDATE community_graph_state SET graph_revision = graph_revision + 1 WHERE singleton = 1;
+END;
+";
+
+const CREATE_SCHEMA_V6: &str = r"
+CREATE TABLE evidence_bundles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK (id > 0),
+    idempotency_key TEXT NOT NULL UNIQUE CHECK (
+        length(trim(idempotency_key)) > 0
+        AND length(CAST(idempotency_key AS BLOB)) <= 128
+    ),
+    canonical_payload TEXT NOT NULL CHECK (
+        json_valid(canonical_payload)
+        AND length(CAST(canonical_payload AS BLOB)) <= 4194304
+    ),
+    applied_by TEXT NOT NULL CHECK (
+        length(trim(applied_by)) > 0 AND length(CAST(applied_by AS BLOB)) <= 256
+    ),
+    apply_policy TEXT NOT NULL CHECK (
+        length(trim(apply_policy)) > 0 AND length(CAST(apply_policy AS BLOB)) <= 256
+    ),
+    applied_at_ms INTEGER NOT NULL CHECK (applied_at_ms >= 0),
+    rolled_back_at_ms INTEGER CHECK (rolled_back_at_ms IS NULL OR rolled_back_at_ms >= applied_at_ms)
+);
+
+CREATE TABLE evidence_items (
+    evidence_id TEXT PRIMARY KEY CHECK (
+        length(trim(evidence_id)) > 0 AND length(CAST(evidence_id AS BLOB)) <= 128
+    ),
+    bundle_id INTEGER NOT NULL REFERENCES evidence_bundles(id) ON DELETE RESTRICT,
+    node_id INTEGER NOT NULL UNIQUE REFERENCES nodes(id) ON DELETE RESTRICT,
+    source_identity TEXT NOT NULL CHECK (
+        length(trim(source_identity)) > 0 AND length(CAST(source_identity AS BLOB)) <= 256
+    ),
+    producer_identity TEXT NOT NULL CHECK (
+        length(trim(producer_identity)) > 0 AND length(CAST(producer_identity AS BLOB)) <= 256
+    ),
+    scope_json TEXT NOT NULL CHECK (json_valid(scope_json) AND json_type(scope_json) = 'object'),
+    lifecycle TEXT NOT NULL CHECK (lifecycle IN (
+        'candidate', 'observed', 'corroborated', 'approved',
+        'contradicted', 'superseded', 'rejected'
+    )),
+    evidence_created_at_ms INTEGER NOT NULL CHECK (evidence_created_at_ms >= 0),
+    observed_at_ms INTEGER CHECK (observed_at_ms IS NULL OR observed_at_ms >= 0),
+    conflict_group TEXT CHECK (
+        conflict_group IS NULL OR (
+            length(trim(conflict_group)) > 0
+            AND length(CAST(conflict_group AS BLOB)) <= 128
+        )
+    ),
+    decision_actor TEXT,
+    decision_policy TEXT,
+    decided_at_ms INTEGER,
+    CHECK (
+        (decision_actor IS NULL AND decision_policy IS NULL AND decided_at_ms IS NULL)
+        OR (decision_actor IS NOT NULL AND decision_policy IS NOT NULL AND decided_at_ms >= 0)
+    )
+);
+CREATE INDEX evidence_items_bundle_idx ON evidence_items(bundle_id, evidence_id);
+CREATE INDEX evidence_items_node_idx ON evidence_items(node_id, evidence_id);
+CREATE INDEX evidence_items_conflict_idx ON evidence_items(conflict_group, evidence_id);
+
+CREATE TABLE evidence_derivations (
+    evidence_id TEXT NOT NULL REFERENCES evidence_items(evidence_id) ON DELETE RESTRICT,
+    supporting_evidence_id TEXT NOT NULL REFERENCES evidence_items(evidence_id) ON DELETE RESTRICT,
+    PRIMARY KEY (evidence_id, supporting_evidence_id),
+    CHECK (evidence_id <> supporting_evidence_id)
+);
+CREATE INDEX evidence_derivations_support_idx
+    ON evidence_derivations(supporting_evidence_id, evidence_id);
+
+CREATE TABLE evidence_conflicts (
+    evidence_id TEXT NOT NULL REFERENCES evidence_items(evidence_id) ON DELETE RESTRICT,
+    conflicting_evidence_id TEXT NOT NULL REFERENCES evidence_items(evidence_id) ON DELETE RESTRICT,
+    PRIMARY KEY (evidence_id, conflicting_evidence_id),
+    CHECK (evidence_id <> conflicting_evidence_id)
+);
+CREATE INDEX evidence_conflicts_target_idx
+    ON evidence_conflicts(conflicting_evidence_id, evidence_id);
+
+CREATE TABLE evidence_supersessions (
+    evidence_id TEXT NOT NULL REFERENCES evidence_items(evidence_id) ON DELETE RESTRICT,
+    superseded_evidence_id TEXT NOT NULL REFERENCES evidence_items(evidence_id) ON DELETE RESTRICT,
+    PRIMARY KEY (evidence_id, superseded_evidence_id),
+    CHECK (evidence_id <> superseded_evidence_id)
+);
+CREATE INDEX evidence_supersessions_target_idx
+    ON evidence_supersessions(superseded_evidence_id, evidence_id);
+
+CREATE TABLE evidence_decision_support (
+    evidence_id TEXT NOT NULL REFERENCES evidence_items(evidence_id) ON DELETE RESTRICT,
+    supporting_evidence_id TEXT NOT NULL REFERENCES evidence_items(evidence_id) ON DELETE RESTRICT,
+    PRIMARY KEY (evidence_id, supporting_evidence_id),
+    CHECK (evidence_id <> supporting_evidence_id)
+);
+CREATE INDEX evidence_decision_support_target_idx
+    ON evidence_decision_support(supporting_evidence_id, evidence_id);
+";
+
 /// Failures returned by durable repository operations.
 #[derive(Debug)]
 pub enum RepositoryError {
@@ -97,6 +267,50 @@ pub enum RepositoryError {
         target: NodeId,
         /// Relation name.
         name: String,
+    },
+    /// A requested feedback event does not exist.
+    FeedbackEventNotFound(FeedbackEventId),
+    /// A versioned evidence DTO failed structural validation.
+    Evidence(EvidenceError),
+    /// An immutable evidence ID already exists in an active bundle.
+    EvidenceIdExists(String),
+    /// An evidence reference does not resolve to an active stored or same-bundle item.
+    EvidenceReferenceNotFound {
+        /// Evidence item declaring the reference.
+        evidence_id: String,
+        /// Reference category.
+        relation: &'static str,
+        /// Missing target evidence ID.
+        target: String,
+    },
+    /// Conflict members do not declare the same stable conflict group.
+    EvidenceConflictGroupMismatch {
+        /// First evidence ID.
+        evidence_id: String,
+        /// Referenced competing evidence ID.
+        target: String,
+    },
+    /// An idempotency key was reused for a different canonical payload.
+    IdempotencyConflict(String),
+    /// A prior application with this key was explicitly rolled back.
+    EvidenceBundleRolledBack(String),
+    /// No evidence-bundle ledger entry exists for the requested key.
+    EvidenceBundleNotFound(String),
+    /// A later durable record prevents compensating deletion of a bundle.
+    EvidenceRollbackBlocked {
+        /// Bundle key requested for rollback.
+        idempotency_key: String,
+        /// Later evidence ID or external graph relation that depends on it.
+        referenced_by: String,
+    },
+    /// No persisted community artifact exists for the requested policy.
+    CommunityArtifactsMissing,
+    /// Persisted communities were built from an older raw graph revision.
+    CommunityArtifactsStale {
+        /// Revision from which the artifacts were built.
+        built_revision: u64,
+        /// Current raw graph revision.
+        current_revision: u64,
     },
     /// The system clock could not produce a durable timestamp.
     Clock(SystemTimeError),
@@ -128,6 +342,56 @@ impl fmt::Display for RepositoryError {
                     "relation {source} -[{name}]-> {target} does not exist"
                 )
             }
+            Self::FeedbackEventNotFound(id) => {
+                write!(formatter, "feedback event {id} does not exist")
+            }
+            Self::Evidence(error) => error.fmt(formatter),
+            Self::EvidenceIdExists(id) => {
+                write!(formatter, "evidence ID {id:?} already exists")
+            }
+            Self::EvidenceReferenceNotFound {
+                evidence_id,
+                relation,
+                target,
+            } => write!(
+                formatter,
+                "evidence {evidence_id:?} has missing {relation} reference {target:?}"
+            ),
+            Self::EvidenceConflictGroupMismatch {
+                evidence_id,
+                target,
+            } => write!(
+                formatter,
+                "conflicting evidence {evidence_id:?} and {target:?} must share one conflict group"
+            ),
+            Self::IdempotencyConflict(key) => write!(
+                formatter,
+                "idempotency key {key:?} already identifies a different evidence payload"
+            ),
+            Self::EvidenceBundleRolledBack(key) => write!(
+                formatter,
+                "evidence bundle {key:?} was rolled back and cannot be silently reapplied"
+            ),
+            Self::EvidenceBundleNotFound(key) => {
+                write!(formatter, "evidence bundle {key:?} does not exist")
+            }
+            Self::EvidenceRollbackBlocked {
+                idempotency_key,
+                referenced_by,
+            } => write!(
+                formatter,
+                "evidence bundle {idempotency_key:?} cannot be rolled back because {referenced_by} depends on it"
+            ),
+            Self::CommunityArtifactsMissing => {
+                formatter.write_str("community artifacts are missing; build them before activation")
+            }
+            Self::CommunityArtifactsStale {
+                built_revision,
+                current_revision,
+            } => write!(
+                formatter,
+                "community artifacts are stale (built at revision {built_revision}, current revision {current_revision}); rebuild before activation"
+            ),
             Self::Clock(error) => write!(formatter, "system clock error: {error}"),
         }
     }
@@ -137,13 +401,24 @@ impl Error for RepositoryError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Validation(error) => Some(error),
+            Self::Evidence(error) => Some(error),
             Self::Database(error) => Some(error),
             Self::Clock(error) => Some(error),
             Self::Busy
             | Self::InvalidDatabase(_)
             | Self::UnsupportedSchema { .. }
             | Self::NodeNotFound(_)
-            | Self::RelationNotFound { .. } => None,
+            | Self::RelationNotFound { .. }
+            | Self::FeedbackEventNotFound(_)
+            | Self::EvidenceIdExists(_)
+            | Self::EvidenceReferenceNotFound { .. }
+            | Self::EvidenceConflictGroupMismatch { .. }
+            | Self::IdempotencyConflict(_)
+            | Self::EvidenceBundleRolledBack(_)
+            | Self::EvidenceBundleNotFound(_)
+            | Self::EvidenceRollbackBlocked { .. }
+            | Self::CommunityArtifactsMissing
+            | Self::CommunityArtifactsStale { .. } => None,
         }
     }
 }
@@ -151,6 +426,12 @@ impl Error for RepositoryError {
 impl From<ValidationError> for RepositoryError {
     fn from(value: ValidationError) -> Self {
         Self::Validation(value)
+    }
+}
+
+impl From<EvidenceError> for RepositoryError {
+    fn from(value: EvidenceError) -> Self {
+        Self::Evidence(value)
     }
 }
 
@@ -209,12 +490,15 @@ impl Repository {
         }
         let connection = Connection::open(path)?;
         connection.busy_timeout(BUSY_TIMEOUT)?;
-        connection.pragma_update(None, "foreign_keys", true)?;
+        connection.pragma_update(None, "foreign_keys", false)?;
         let mut repository = Self {
             connection,
             path: path.to_path_buf(),
         };
         repository.open_or_migrate()?;
+        repository
+            .connection
+            .pragma_update(None, "foreign_keys", true)?;
         Ok(repository)
     }
 
@@ -266,6 +550,26 @@ impl Repository {
                 ))
             })?;
             messages.extend(rows.collect::<Result<Vec<_>, _>>()?);
+        }
+        let nodes_table_exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'nodes')",
+            [],
+            |row| row.get(0),
+        )?;
+        if nodes_table_exists {
+            let mut statement = connection.prepare(
+                "SELECT id FROM nodes
+                 WHERE (x IS NULL) <> (y IS NULL)
+                    OR (x IS NULL) <> (z IS NULL)
+                    OR (x IS NOT NULL AND (typeof(x) <> 'real' OR x < -1000000.0 OR x > 1000000.0))
+                    OR (y IS NOT NULL AND (typeof(y) <> 'real' OR y < -1000000.0 OR y > 1000000.0))
+                    OR (z IS NOT NULL AND (typeof(z) <> 'real' OR z < -1000000.0 OR z > 1000000.0))
+                 ORDER BY id",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+            for id in rows {
+                messages.push(format!("node {} has invalid coordinates", id?));
+            }
         }
 
         let metadata = connection
@@ -355,6 +659,40 @@ impl Repository {
             )
             .optional()?;
         raw.map(decode_node).transpose()
+    }
+
+    /// Replaces or clears one node's externally assigned coordinates.
+    ///
+    /// This updates the node timestamp transactionally.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed missing-node error or a database/decoding error.
+    pub fn update_node_coordinates(
+        &mut self,
+        id: NodeId,
+        coordinates: Option<Coordinates>,
+    ) -> Result<MemoryNode, RepositoryError> {
+        let now = unix_time_ms()?;
+        let (x, y, z) = coordinates_parts(coordinates);
+        let changed = self.connection.execute(
+            "UPDATE nodes
+             SET x = ?2, y = ?3, z = ?4,
+                 updated_at_ms = CASE
+                     WHEN updated_at_ms >= ?5 THEN updated_at_ms + 1
+                     ELSE ?5
+                 END
+             WHERE id = ?1",
+            params![id_to_i64(id)?, x, y, z, now],
+        )?;
+        if changed == 0 {
+            return Err(RepositoryError::NodeNotFound(id));
+        }
+        self.get_node(id)?.ok_or_else(|| {
+            RepositoryError::InvalidDatabase(format!(
+                "node {id} disappeared after coordinate update"
+            ))
+        })
     }
 
     /// Lists all nodes in stable ID order.
@@ -475,6 +813,127 @@ impl Repository {
         })
     }
 
+    /// Records one explicit feedback event for an existing relation.
+    ///
+    /// Positive events increment the relation's informational `reinforcement_count`; negative
+    /// events are stored separately and never create invalid weights. Activation is affected only
+    /// by opt-in feedback-aware retrieval.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error, [`RepositoryError::RelationNotFound`], or a database error.
+    pub fn record_relation_feedback(
+        &mut self,
+        event: NewFeedbackEvent,
+    ) -> Result<FeedbackEvent, RepositoryError> {
+        let now = unix_time_ms()?;
+        let transaction = self.connection.transaction()?;
+        ensure_relation_exists(
+            &transaction,
+            event.source,
+            event.target,
+            &event.relation_name,
+        )?;
+        transaction.execute(
+            "INSERT INTO relation_feedback_events (source_id, target_id, relation_name, kind, strength, occurred_at_ms, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                id_to_i64(event.source)?,
+                id_to_i64(event.target)?,
+                event.relation_name,
+                event.kind.as_str(),
+                event.strength,
+                event.occurred_at_ms,
+                now
+            ],
+        )?;
+        let id = feedback_id_from_i64(transaction.last_insert_rowid())?;
+        let increment = i64::from(matches!(event.kind, FeedbackKind::Positive));
+        transaction.execute(
+            "UPDATE relations SET reinforcement_count = reinforcement_count + ?1, updated_at_ms = max(updated_at_ms, ?2) WHERE source_id = ?3 AND target_id = ?4 AND name = ?5",
+            params![
+                increment,
+                now,
+                id_to_i64(event.source)?,
+                id_to_i64(event.target)?,
+                event.relation_name
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(FeedbackEvent::from_stored(id, event, now))
+    }
+
+    /// Removes one feedback event and returns the removed event.
+    ///
+    /// This is the rollback operation for feedback-aware retrieval. It only removes the selected
+    /// event and compensates the informational positive counter when needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::FeedbackEventNotFound`] or a database error.
+    pub fn remove_feedback_event(
+        &mut self,
+        id: FeedbackEventId,
+    ) -> Result<FeedbackEvent, RepositoryError> {
+        let transaction = self.connection.transaction()?;
+        let event = get_feedback_event_in_transaction(&transaction, id)?
+            .ok_or(RepositoryError::FeedbackEventNotFound(id))?;
+        transaction.execute(
+            "DELETE FROM relation_feedback_events WHERE id = ?1",
+            [feedback_id_to_i64(id)?],
+        )?;
+        if matches!(event.kind(), FeedbackKind::Positive) {
+            transaction.execute(
+                "UPDATE relations SET reinforcement_count = max(reinforcement_count - 1, 0), updated_at_ms = max(updated_at_ms, ?1) WHERE source_id = ?2 AND target_id = ?3 AND name = ?4",
+                params![
+                    unix_time_ms()?,
+                    id_to_i64(event.source())?,
+                    id_to_i64(event.target())?,
+                    event.relation_name()
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(event)
+    }
+
+    /// Lists explicit feedback events for one relation in deterministic event order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation, missing-relation, decoding, or database error.
+    pub fn list_relation_feedback(
+        &self,
+        source: NodeId,
+        target: NodeId,
+        name: &str,
+    ) -> Result<Vec<FeedbackEvent>, RepositoryError> {
+        let name = validate_string(name.to_owned(), "relation name", MAX_RELATION_NAME_BYTES)?;
+        if self.get_relation(source, target, &name)?.is_none() {
+            return Err(RepositoryError::RelationNotFound {
+                source,
+                target,
+                name,
+            });
+        }
+        self.feedback_events_for_relation(source, target, &name)
+    }
+
+    pub(crate) fn feedback_events_for_relation(
+        &self,
+        source: NodeId,
+        target: NodeId,
+        name: &str,
+    ) -> Result<Vec<FeedbackEvent>, RepositoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, source_id, target_id, relation_name, kind, strength, occurred_at_ms, created_at_ms FROM relation_feedback_events WHERE source_id = ?1 AND target_id = ?2 AND relation_name = ?3 ORDER BY occurred_at_ms, id",
+        )?;
+        let rows = statement.query_map(
+            params![id_to_i64(source)?, id_to_i64(target)?, name],
+            read_feedback_event_row,
+        )?;
+        rows.map(|row| decode_feedback_event(row?)).collect()
+    }
+
     fn open_or_migrate(&mut self) -> Result<(), RepositoryError> {
         let metadata_exists: bool = self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory3d_schema')",
@@ -501,9 +960,7 @@ impl Repository {
                 "INSERT INTO memory3d_schema (singleton, format_id, schema_version, created_at_ms) VALUES (1, ?1, 0, ?2)",
                 params![FORMAT_ID, unix_time_ms()?],
             )?;
-            migrate_v0_to_v1(&transaction)?;
-            migrate_v1_to_v2(&transaction)?;
-            migrate_v2_to_v3(&transaction)?;
+            migrate_to_current(&transaction, 0)?;
             transaction.commit()?;
             return Ok(());
         }
@@ -524,34 +981,67 @@ impl Repository {
                 supported: SCHEMA_VERSION,
             });
         }
-        match version {
-            0 => {
-                let transaction = self.connection.transaction()?;
-                migrate_v0_to_v1(&transaction)?;
-                migrate_v1_to_v2(&transaction)?;
-                migrate_v2_to_v3(&transaction)?;
-                transaction.commit()?;
-                Ok(())
-            }
-            1 => {
-                let transaction = self.connection.transaction()?;
-                migrate_v1_to_v2(&transaction)?;
-                migrate_v2_to_v3(&transaction)?;
-                transaction.commit()?;
-                Ok(())
-            }
-            2 => {
-                let transaction = self.connection.transaction()?;
-                migrate_v2_to_v3(&transaction)?;
-                transaction.commit()?;
-                Ok(())
-            }
-            SCHEMA_VERSION => Ok(()),
-            _ => Err(RepositoryError::InvalidDatabase(format!(
+        if !(0..=SCHEMA_VERSION).contains(&version) {
+            return Err(RepositoryError::InvalidDatabase(format!(
                 "unsupported historical schema version {version}"
-            ))),
+            )));
         }
+        if version >= 1 {
+            validate_stored_coordinates(&self.connection)?;
+        }
+        if version == SCHEMA_VERSION {
+            return Ok(());
+        }
+        let transaction = self.connection.transaction()?;
+        migrate_to_current(&transaction, version)?;
+        transaction.commit()?;
+        Ok(())
     }
+}
+
+fn validate_stored_coordinates(connection: &Connection) -> Result<(), RepositoryError> {
+    let mut statement = connection.prepare(
+        "SELECT id FROM nodes
+         WHERE (x IS NULL) <> (y IS NULL)
+            OR (x IS NULL) <> (z IS NULL)
+            OR (x IS NOT NULL AND (typeof(x) <> 'real' OR x < -1000000.0 OR x > 1000000.0))
+            OR (y IS NOT NULL AND (typeof(y) <> 'real' OR y < -1000000.0 OR y > 1000000.0))
+            OR (z IS NOT NULL AND (typeof(z) <> 'real' OR z < -1000000.0 OR z > 1000000.0))
+         ORDER BY id",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+    if let Some(id) = rows.into_iter().next() {
+        return Err(RepositoryError::InvalidDatabase(format!(
+            "node {} has invalid coordinates",
+            id?
+        )));
+    }
+    Ok(())
+}
+
+fn migrate_to_current(transaction: &Transaction<'_>, version: i64) -> Result<(), RepositoryError> {
+    if version == 0 {
+        migrate_v0_to_v1(transaction)?;
+    }
+    if version <= 1 {
+        migrate_v1_to_v2(transaction)?;
+    }
+    if version <= 2 {
+        migrate_v2_to_v3(transaction)?;
+    }
+    if version <= 3 {
+        migrate_v3_to_v4(transaction)?;
+    }
+    if version <= 4 {
+        migrate_v4_to_v5(transaction)?;
+    }
+    if version <= 5 {
+        migrate_v5_to_v6(transaction)?;
+    }
+    if version <= 6 {
+        migrate_v6_to_v7(transaction)?;
+    }
+    Ok(())
 }
 
 fn migrate_v1_to_v2(transaction: &Transaction<'_>) -> Result<(), RepositoryError> {
@@ -586,7 +1076,83 @@ fn migrate_v2_to_v3(transaction: &Transaction<'_>) -> Result<(), RepositoryError
     Ok(())
 }
 
-fn index_node_terms(
+fn migrate_v3_to_v4(transaction: &Transaction<'_>) -> Result<(), RepositoryError> {
+    transaction.execute_batch(CREATE_SCHEMA_V4)?;
+    transaction.execute(
+        "UPDATE memory3d_schema SET schema_version = 4 WHERE singleton = 1 AND schema_version = 3",
+        [],
+    )?;
+    Ok(())
+}
+
+fn migrate_v4_to_v5(transaction: &Transaction<'_>) -> Result<(), RepositoryError> {
+    transaction.execute_batch(CREATE_SCHEMA_V5)?;
+    transaction.execute(
+        "UPDATE memory3d_schema SET schema_version = 5 WHERE singleton = 1 AND schema_version = 4",
+        [],
+    )?;
+    Ok(())
+}
+
+fn migrate_v5_to_v6(transaction: &Transaction<'_>) -> Result<(), RepositoryError> {
+    transaction.execute_batch(CREATE_SCHEMA_V6)?;
+    transaction.execute(
+        "UPDATE memory3d_schema SET schema_version = 6 WHERE singleton = 1 AND schema_version = 5",
+        [],
+    )?;
+    Ok(())
+}
+
+fn migrate_v6_to_v7(transaction: &Transaction<'_>) -> Result<(), RepositoryError> {
+    transaction.execute_batch(
+        r"
+        CREATE TABLE nodes_v7 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT CHECK (id > 0),
+            kind TEXT NOT NULL CHECK (length(kind) > 0 AND length(CAST(kind AS BLOB)) <= 64),
+            text TEXT NOT NULL CHECK (length(trim(text)) > 0 AND length(CAST(text AS BLOB)) <= 1048576),
+            metadata TEXT NOT NULL CHECK (
+                json_valid(metadata) AND json_type(metadata) = 'object'
+                AND length(CAST(metadata AS BLOB)) <= 65536
+            ),
+            importance REAL NOT NULL CHECK (importance >= 0.0 AND importance <= 1.0),
+            created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+            updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+            x REAL,
+            y REAL,
+            z REAL,
+            CHECK ((x IS NULL AND y IS NULL AND z IS NULL) OR
+                   (x IS NOT NULL AND y IS NOT NULL AND z IS NOT NULL)),
+            CHECK (x IS NULL OR (typeof(x) = 'real' AND x >= -1000000.0 AND x <= 1000000.0)),
+            CHECK (y IS NULL OR (typeof(y) = 'real' AND y >= -1000000.0 AND y <= 1000000.0)),
+            CHECK (z IS NULL OR (typeof(z) = 'real' AND z >= -1000000.0 AND z <= 1000000.0))
+        );
+        INSERT INTO nodes_v7
+            SELECT id, kind, text, metadata, importance, created_at_ms, updated_at_ms, x, y, z
+            FROM nodes;
+        DROP TABLE nodes;
+        ALTER TABLE nodes_v7 RENAME TO nodes;
+        CREATE TRIGGER community_nodes_insert_revision
+        AFTER INSERT ON nodes BEGIN
+            UPDATE community_graph_state SET graph_revision = graph_revision + 1 WHERE singleton = 1;
+        END;
+        CREATE TRIGGER community_nodes_update_revision
+        AFTER UPDATE ON nodes BEGIN
+            UPDATE community_graph_state SET graph_revision = graph_revision + 1 WHERE singleton = 1;
+        END;
+        CREATE TRIGGER community_nodes_delete_revision
+        AFTER DELETE ON nodes BEGIN
+            UPDATE community_graph_state SET graph_revision = graph_revision + 1 WHERE singleton = 1;
+        END;
+        ",
+    )?;
+    transaction.execute(
+        "UPDATE memory3d_schema SET schema_version = 7 WHERE singleton = 1 AND schema_version = 6",
+        [],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn index_node_terms(
     transaction: &Transaction<'_>,
     id: NodeId,
     kind: &str,
@@ -614,7 +1180,7 @@ fn migrate_v0_to_v1(transaction: &Transaction<'_>) -> Result<(), RepositoryError
     Ok(())
 }
 
-fn unix_time_ms() -> Result<i64, RepositoryError> {
+pub(crate) fn unix_time_ms() -> Result<i64, RepositoryError> {
     let millis = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
     i64::try_from(millis).map_err(|_| {
         RepositoryError::InvalidDatabase("system time exceeds SQLite integer range".to_owned())
@@ -651,6 +1217,41 @@ fn ensure_node_exists(transaction: &Transaction<'_>, id: NodeId) -> Result<(), R
     } else {
         Err(RepositoryError::NodeNotFound(id))
     }
+}
+
+fn ensure_relation_exists(
+    transaction: &Transaction<'_>,
+    source: NodeId,
+    target: NodeId,
+    name: &str,
+) -> Result<(), RepositoryError> {
+    let exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM relations WHERE source_id = ?1 AND target_id = ?2 AND name = ?3)",
+        params![id_to_i64(source)?, id_to_i64(target)?, name],
+        |row| row.get(0),
+    )?;
+    if exists {
+        Ok(())
+    } else {
+        Err(RepositoryError::RelationNotFound {
+            source,
+            target,
+            name: name.to_owned(),
+        })
+    }
+}
+
+pub(crate) fn feedback_id_to_i64(id: FeedbackEventId) -> Result<i64, RepositoryError> {
+    i64::try_from(id.get()).map_err(|_| {
+        RepositoryError::InvalidDatabase(format!("feedback event ID {id} exceeds storage range"))
+    })
+}
+
+pub(crate) fn feedback_id_from_i64(value: i64) -> Result<FeedbackEventId, RepositoryError> {
+    let value = u128::try_from(value).map_err(|_| {
+        RepositoryError::InvalidDatabase(format!("stored feedback event ID {value} is invalid"))
+    })?;
+    FeedbackEventId::new(value).map_err(RepositoryError::from)
 }
 
 type RawNode = (
@@ -734,4 +1335,59 @@ pub(crate) fn decode_relation(raw: RawRelation) -> Result<Relation, RepositoryEr
         RepositoryError::InvalidDatabase("relation has a negative reinforcement count".to_owned())
     })?;
     Ok(Relation::from_stored(new, created, updated, reinforcement))
+}
+
+type RawFeedbackEvent = (i64, i64, i64, String, String, f32, i64, i64);
+
+pub(crate) fn read_feedback_event_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RawFeedbackEvent> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+    ))
+}
+
+pub(crate) fn decode_feedback_event(
+    raw: RawFeedbackEvent,
+) -> Result<FeedbackEvent, RepositoryError> {
+    let (id, source, target, relation_name, kind, strength, occurred, created) = raw;
+    let new = NewFeedbackEvent::new(
+        id_from_i64(source)?,
+        id_from_i64(target)?,
+        relation_name,
+        FeedbackKind::from_str(&kind)?,
+        strength,
+        occurred,
+    )?;
+    if created < 0 {
+        return Err(RepositoryError::InvalidDatabase(
+            "feedback event has invalid created timestamp".to_owned(),
+        ));
+    }
+    Ok(FeedbackEvent::from_stored(
+        feedback_id_from_i64(id)?,
+        new,
+        created,
+    ))
+}
+
+fn get_feedback_event_in_transaction(
+    transaction: &Transaction<'_>,
+    id: FeedbackEventId,
+) -> Result<Option<FeedbackEvent>, RepositoryError> {
+    let raw = transaction
+        .query_row(
+            "SELECT id, source_id, target_id, relation_name, kind, strength, occurred_at_ms, created_at_ms FROM relation_feedback_events WHERE id = ?1",
+            [feedback_id_to_i64(id)?],
+            read_feedback_event_row,
+        )
+        .optional()?;
+    raw.map(decode_feedback_event).transpose()
 }

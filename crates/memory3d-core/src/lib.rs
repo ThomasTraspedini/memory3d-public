@@ -4,13 +4,28 @@
 
 use std::{error::Error, fmt, num::NonZeroU128};
 
+mod community;
+mod evidence;
 mod repository;
 mod retrieval;
 
+pub use community::{
+    CommunityBuildReport, CommunityMembership, CommunityPolicy, CommunityResolution,
+    CommunityResolutionSummary, CommunityStatus,
+};
+pub use evidence::{
+    AppliedEvidenceItem, ApplyAuthorization, BundleApplyReport, BundlePreview, BundlePreviewStatus,
+    BundleRollbackReport, ContextExclusionReason, ContextPackage, ContextStopReason,
+    DEFAULT_EVIDENCE_MIN_RELEVANCE, DecisionProvenance, EvidenceBundle, EvidenceContextItem,
+    EvidenceContextOptions, EvidenceError, EvidenceItem, EvidenceLifecycle, MAX_BUNDLE_BYTES,
+    MAX_BUNDLE_ITEMS, MAX_CONTEXT_BYTES, MAX_EVIDENCE_CANDIDATE_SCAN_LIMIT, MAX_EVIDENCE_ID_BYTES,
+    MAX_EVIDENCE_REFERENCES, MAX_IDENTITY_BYTES, MAX_SCOPE_ENTRIES, StoredEvidence,
+};
 pub use repository::{IntegrityReport, Repository, RepositoryError};
 pub use retrieval::{
-    ActivationReport, ActivationTimings, AdjacencyInspection, DatabaseStats, SearchOptions,
-    SearchResult, TraversalStats,
+    ActivationReport, ActivationTimings, AdjacencyInspection, CommunityDiagnostics,
+    CommunityEdgeDiagnostic, CommunityPathProvenance, CommunityRoute, DatabaseStats,
+    FeedbackPolicy, SearchOptions, SearchResult, TraversalStats,
 };
 
 /// Maximum UTF-8 byte length accepted for memory text.
@@ -35,6 +50,9 @@ pub const MAX_RESULTS: usize = 100;
 pub const MAX_VISITED_NODES: usize = 10_000;
 /// Maximum number of edges an activation may examine.
 pub const MAX_VISITED_EDGES: usize = 50_000;
+/// Inclusive absolute bound for each coordinate component in the documented local frame.
+pub const MAX_COORDINATE_ABS: f64 = 1_000_000.0;
+const MAX_COORDINATE_ABS_F32: f32 = 1_000_000.0;
 
 /// Identifies which public input failed validation.
 #[derive(Debug, Clone, PartialEq)]
@@ -43,6 +61,8 @@ pub enum ValidationError {
     Empty(&'static str),
     /// An identifier was zero, which is reserved as invalid.
     ZeroId,
+    /// A feedback-event identifier was zero, which is reserved as invalid.
+    ZeroFeedbackEventId,
     /// A string exceeded its UTF-8 byte limit.
     TooLong {
         /// Input field name.
@@ -79,6 +99,7 @@ impl fmt::Display for ValidationError {
         match self {
             Self::Empty(field) => write!(formatter, "{field} must not be empty"),
             Self::ZeroId => formatter.write_str("node ID must be non-zero"),
+            Self::ZeroFeedbackEventId => formatter.write_str("feedback event ID must be non-zero"),
             Self::TooLong { field, max_bytes } => {
                 write!(formatter, "{field} must be at most {max_bytes} bytes")
             }
@@ -97,6 +118,33 @@ impl fmt::Display for ValidationError {
                 formatter.write_str("activation path must end at the result node")
             }
         }
+    }
+}
+
+/// Stable, opaque identifier for an explicit feedback event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FeedbackEventId(NonZeroU128);
+
+impl FeedbackEventId {
+    /// Creates an ID, rejecting the reserved zero value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::ZeroFeedbackEventId`] when `value` is zero.
+    pub fn new(value: u128) -> Result<Self, ValidationError> {
+        NonZeroU128::new(value).map_or(Err(ValidationError::ZeroFeedbackEventId), |id| Ok(Self(id)))
+    }
+
+    /// Returns the numeric representation used for durable round trips.
+    #[must_use]
+    pub const fn get(self) -> u128 {
+        self.0.get()
+    }
+}
+
+impl fmt::Display for FeedbackEventId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
     }
 }
 
@@ -139,7 +187,10 @@ impl Metadata {
     }
 }
 
-/// Optional three-dimensional coordinates reserved for later retrieval experiments.
+/// Optional three-dimensional coordinates in a caller-defined local Cartesian frame.
+///
+/// All coordinates in one database must use the same caller-defined frame, origin, and scale. The
+/// core validates numeric shape and range; it cannot infer or verify frame identity.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Coordinates {
     x: f64,
@@ -148,18 +199,19 @@ pub struct Coordinates {
 }
 
 impl Coordinates {
-    /// Creates finite coordinates.
+    /// Creates finite coordinates within the supported local-frame range.
     ///
     /// # Errors
     ///
-    /// Returns a validation error if any component is not finite.
+    /// Returns a validation error if any component is not finite or its absolute value exceeds
+    /// [`MAX_COORDINATE_ABS`].
     pub fn new(x: f64, y: f64, z: f64) -> Result<Self, ValidationError> {
         for (field, value) in [("x", x), ("y", y), ("z", z)] {
-            if !value.is_finite() {
+            if !value.is_finite() || !(-MAX_COORDINATE_ABS..=MAX_COORDINATE_ABS).contains(&value) {
                 return Err(ValidationError::InvalidNumber {
                     field,
-                    min: f32::MIN,
-                    max: f32::MAX,
+                    min: -MAX_COORDINATE_ABS_F32,
+                    max: MAX_COORDINATE_ABS_F32,
                 });
             }
         }
@@ -472,6 +524,163 @@ impl Relation {
     }
 }
 
+/// Polarity for an explicit operator feedback event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedbackKind {
+    /// Increase future feedback-aware activation through the relation.
+    Positive,
+    /// Decrease future feedback-aware activation through the relation.
+    Negative,
+}
+
+impl FeedbackKind {
+    /// Returns the stable storage/report label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Positive => "positive",
+            Self::Negative => "negative",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Result<Self, ValidationError> {
+        match value {
+            "positive" => Ok(Self::Positive),
+            "negative" => Ok(Self::Negative),
+            _ => Err(ValidationError::Empty("feedback kind")),
+        }
+    }
+}
+
+/// Validated input for recording explicit feedback on one existing relation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewFeedbackEvent {
+    pub(crate) source: NodeId,
+    pub(crate) target: NodeId,
+    pub(crate) relation_name: String,
+    pub(crate) kind: FeedbackKind,
+    pub(crate) strength: f32,
+    pub(crate) occurred_at_ms: i64,
+}
+
+impl NewFeedbackEvent {
+    /// Creates an explicit feedback event for one stored relation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for an invalid relation name, non-finite strength outside
+    /// `(0, 1]`, or a negative deterministic event timestamp.
+    pub fn new(
+        source: NodeId,
+        target: NodeId,
+        relation_name: impl Into<String>,
+        kind: FeedbackKind,
+        strength: f32,
+        occurred_at_ms: i64,
+    ) -> Result<Self, ValidationError> {
+        let relation_name = validate_string(
+            relation_name.into(),
+            "relation name",
+            MAX_RELATION_NAME_BYTES,
+        )?;
+        if !(strength.is_finite() && strength > 0.0 && strength <= 1.0) {
+            return Err(ValidationError::InvalidNumber {
+                field: "feedback strength",
+                min: f32::MIN_POSITIVE,
+                max: 1.0,
+            });
+        }
+        if occurred_at_ms < 0 {
+            return Err(ValidationError::OutOfRange {
+                field: "occurred_at_ms",
+                min: 0,
+                max: usize::MAX,
+            });
+        }
+        Ok(Self {
+            source,
+            target,
+            relation_name,
+            kind,
+            strength,
+            occurred_at_ms,
+        })
+    }
+}
+
+/// Durable explicit feedback event attached to one relation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeedbackEvent {
+    id: FeedbackEventId,
+    source: NodeId,
+    target: NodeId,
+    relation_name: String,
+    kind: FeedbackKind,
+    strength: f32,
+    occurred_at_ms: i64,
+    created_at_ms: i64,
+}
+
+impl FeedbackEvent {
+    pub(crate) fn from_stored(
+        id: FeedbackEventId,
+        new: NewFeedbackEvent,
+        created_at_ms: i64,
+    ) -> Self {
+        Self {
+            id,
+            source: new.source,
+            target: new.target,
+            relation_name: new.relation_name,
+            kind: new.kind,
+            strength: new.strength,
+            occurred_at_ms: new.occurred_at_ms,
+            created_at_ms,
+        }
+    }
+
+    /// Returns the event identifier.
+    #[must_use]
+    pub const fn id(&self) -> FeedbackEventId {
+        self.id
+    }
+    /// Returns the relation source.
+    #[must_use]
+    pub const fn source(&self) -> NodeId {
+        self.source
+    }
+    /// Returns the relation target.
+    #[must_use]
+    pub const fn target(&self) -> NodeId {
+        self.target
+    }
+    /// Returns the relation name.
+    #[must_use]
+    pub fn relation_name(&self) -> &str {
+        &self.relation_name
+    }
+    /// Returns the feedback polarity.
+    #[must_use]
+    pub const fn kind(&self) -> FeedbackKind {
+        self.kind
+    }
+    /// Returns the event strength in `(0, 1]`.
+    #[must_use]
+    pub const fn strength(&self) -> f32 {
+        self.strength
+    }
+    /// Returns the deterministic operator-supplied event timestamp.
+    #[must_use]
+    pub const fn occurred_at_ms(&self) -> i64 {
+        self.occurred_at_ms
+    }
+    /// Returns the durable insertion timestamp.
+    #[must_use]
+    pub const fn created_at_ms(&self) -> i64 {
+        self.created_at_ms
+    }
+}
+
 /// Validated input for creating a directed relation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewRelation {
@@ -509,7 +718,7 @@ impl NewRelation {
 pub struct ActivationOptions {
     /// Maximum relation depth.
     pub hops: u8,
-    /// Maximum number of lexical seeds.
+    /// Maximum number of selected seeds.
     pub seed_limit: usize,
     /// Maximum number of results.
     pub limit: usize,
@@ -585,7 +794,7 @@ impl PathStep {
     }
 }
 
-/// Ordered path from a lexical seed to an activated node.
+/// Ordered path from a selected seed to an activated node.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ActivationPath {
     /// Seed at which activation began.

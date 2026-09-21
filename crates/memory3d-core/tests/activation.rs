@@ -173,6 +173,53 @@ fn best_path_wins_cycles_terminate_and_ties_use_node_id() -> TestResult {
 }
 
 #[test]
+fn equal_score_results_use_evidence_tie_break_order() -> TestResult {
+    let directory = tempdir()?;
+    let mut repository = Repository::open(directory.path().join("result-order.memory3d"))?;
+    let seed = repository.add_node(memory("seed", "tie query", 1.0)?)?;
+    let importance_first = repository.add_node(memory("zeta", "same", 0.6)?)?;
+    let kind_first = repository.add_node(memory("alpha", "zulu", 0.5)?)?;
+    let kind_second = repository.add_node(memory("beta", "alpha", 0.5)?)?;
+    let text_first = repository.add_node(memory("beta", "alpha", 0.5)?)?;
+    let text_second = repository.add_node(memory("beta", "bravo", 0.5)?)?;
+    let id_fallback = repository.add_node(memory("beta", "bravo", 0.5)?)?;
+    repository.add_relations(&[
+        NewRelation::new(seed.id(), kind_first.id(), "tie", 0.5)?,
+        NewRelation::new(seed.id(), kind_second.id(), "tie", 0.5)?,
+        NewRelation::new(seed.id(), text_first.id(), "tie", 0.5)?,
+        NewRelation::new(seed.id(), text_second.id(), "tie", 0.5)?,
+        NewRelation::new(seed.id(), importance_first.id(), "tie", 0.5)?,
+        NewRelation::new(seed.id(), id_fallback.id(), "tie", 0.5)?,
+    ])?;
+
+    let report = repository.activate(
+        "tie query",
+        &ActivationOptions {
+            limit: 6,
+            seed_limit: 1,
+            ..ActivationOptions::default()
+        },
+    )?;
+
+    assert_eq!(
+        report
+            .results
+            .iter()
+            .map(|result| result.node.id())
+            .collect::<Vec<_>>(),
+        vec![
+            importance_first.id(),
+            kind_first.id(),
+            kind_second.id(),
+            text_first.id(),
+            text_second.id(),
+            id_fallback.id()
+        ]
+    );
+    Ok(())
+}
+
+#[test]
 fn seed_filter_hop_limit_and_work_budgets_are_enforced() -> TestResult {
     let directory = tempdir()?;
     let mut repository = Repository::open(directory.path().join("bounds.memory3d"))?;
@@ -405,7 +452,35 @@ fn migrated_index_and_activation_are_identical_after_reopen() -> TestResult {
 
     let connection = Connection::open(&path)?;
     connection.execute_batch(
-        "DROP INDEX relations_adjacency_idx; DROP INDEX node_terms_term_idx; DROP TABLE node_terms; UPDATE memory3d_schema SET schema_version = 1 WHERE singleton = 1;",
+        "DROP INDEX evidence_decision_support_target_idx;
+         DROP TABLE evidence_decision_support;
+         DROP INDEX evidence_supersessions_target_idx;
+         DROP TABLE evidence_supersessions;
+         DROP INDEX evidence_conflicts_target_idx;
+         DROP TABLE evidence_conflicts;
+         DROP INDEX evidence_derivations_support_idx;
+         DROP TABLE evidence_derivations;
+         DROP INDEX evidence_items_conflict_idx;
+         DROP INDEX evidence_items_node_idx;
+         DROP INDEX evidence_items_bundle_idx;
+         DROP TABLE evidence_items;
+         DROP TABLE evidence_bundles;
+         DROP TRIGGER community_nodes_insert_revision;
+         DROP TRIGGER community_nodes_update_revision;
+         DROP TRIGGER community_nodes_delete_revision;
+         DROP TRIGGER community_relations_insert_revision;
+         DROP TRIGGER community_relations_update_revision;
+         DROP TRIGGER community_relations_delete_revision;
+         DROP INDEX community_memberships_lookup_idx;
+         DROP TABLE community_memberships;
+         DROP TABLE community_builds;
+         DROP TABLE community_graph_state;
+         DROP INDEX relation_feedback_relation_idx;
+         DROP TABLE relation_feedback_events;
+         DROP INDEX relations_adjacency_idx;
+         DROP INDEX node_terms_term_idx;
+         DROP TABLE node_terms;
+         UPDATE memory3d_schema SET schema_version = 1 WHERE singleton = 1;",
     )?;
     drop(connection);
     let migrated = Repository::open(path)?;

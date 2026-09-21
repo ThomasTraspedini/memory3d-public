@@ -37,7 +37,7 @@ fn creates_empty_versioned_database() -> TestResult {
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    assert_eq!(metadata, ("memory3d".to_owned(), 3));
+    assert_eq!(metadata, ("memory3d".to_owned(), 7));
     Ok(())
 }
 
@@ -245,7 +245,7 @@ fn migrates_version_zero_transactionally() -> TestResult {
         [],
         |row| row.get(0),
     )?;
-    assert_eq!(version, 3);
+    assert_eq!(version, 7);
     Ok(())
 }
 
@@ -256,7 +256,32 @@ fn migrates_version_two_with_adjacency_index() -> TestResult {
     drop(Repository::open(&path)?);
     let connection = Connection::open(&path)?;
     connection.execute_batch(
-        "DROP INDEX relations_adjacency_idx;
+        "DROP INDEX evidence_decision_support_target_idx;
+         DROP TABLE evidence_decision_support;
+         DROP INDEX evidence_supersessions_target_idx;
+         DROP TABLE evidence_supersessions;
+         DROP INDEX evidence_conflicts_target_idx;
+         DROP TABLE evidence_conflicts;
+         DROP INDEX evidence_derivations_support_idx;
+         DROP TABLE evidence_derivations;
+         DROP INDEX evidence_items_conflict_idx;
+         DROP INDEX evidence_items_node_idx;
+         DROP INDEX evidence_items_bundle_idx;
+         DROP TABLE evidence_items;
+         DROP TABLE evidence_bundles;
+         DROP TRIGGER community_nodes_insert_revision;
+         DROP TRIGGER community_nodes_update_revision;
+         DROP TRIGGER community_nodes_delete_revision;
+         DROP TRIGGER community_relations_insert_revision;
+         DROP TRIGGER community_relations_update_revision;
+         DROP TRIGGER community_relations_delete_revision;
+         DROP INDEX community_memberships_lookup_idx;
+         DROP TABLE community_memberships;
+         DROP TABLE community_builds;
+         DROP TABLE community_graph_state;
+         DROP INDEX relation_feedback_relation_idx;
+         DROP TABLE relation_feedback_events;
+         DROP INDEX relations_adjacency_idx;
          UPDATE memory3d_schema SET schema_version = 2 WHERE singleton = 1;",
     )?;
     drop(connection);
@@ -273,8 +298,59 @@ fn migrates_version_two_with_adjacency_index() -> TestResult {
         [],
         |row| row.get(0),
     )?;
-    assert_eq!(version, 3);
+    assert_eq!(version, 7);
     assert!(index_exists);
+    Ok(())
+}
+
+#[test]
+fn migrates_previous_version_four_with_community_schema() -> TestResult {
+    let directory = tempdir()?;
+    let path = directory.path().join("community-migration.memory3d");
+    drop(Repository::open(&path)?);
+    let connection = Connection::open(&path)?;
+    connection.execute_batch(
+        "DROP INDEX evidence_decision_support_target_idx;
+         DROP TABLE evidence_decision_support;
+         DROP INDEX evidence_supersessions_target_idx;
+         DROP TABLE evidence_supersessions;
+         DROP INDEX evidence_conflicts_target_idx;
+         DROP TABLE evidence_conflicts;
+         DROP INDEX evidence_derivations_support_idx;
+         DROP TABLE evidence_derivations;
+         DROP INDEX evidence_items_conflict_idx;
+         DROP INDEX evidence_items_node_idx;
+         DROP INDEX evidence_items_bundle_idx;
+         DROP TABLE evidence_items;
+         DROP TABLE evidence_bundles;
+         DROP TRIGGER community_nodes_insert_revision;
+         DROP TRIGGER community_nodes_update_revision;
+         DROP TRIGGER community_nodes_delete_revision;
+         DROP TRIGGER community_relations_insert_revision;
+         DROP TRIGGER community_relations_update_revision;
+         DROP TRIGGER community_relations_delete_revision;
+         DROP INDEX community_memberships_lookup_idx;
+         DROP TABLE community_memberships;
+         DROP TABLE community_builds;
+         DROP TABLE community_graph_state;
+         UPDATE memory3d_schema SET schema_version = 4 WHERE singleton = 1;",
+    )?;
+    drop(connection);
+
+    drop(Repository::open(&path)?);
+    let connection = Connection::open(path)?;
+    let version: i64 = connection.query_row(
+        "SELECT schema_version FROM memory3d_schema WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let state_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'community_graph_state')",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(version, 7);
+    assert!(state_exists);
     Ok(())
 }
 
@@ -289,7 +365,7 @@ fn newer_schema_is_rejected_without_changing_file_hash() -> TestResult {
     let connection = Connection::open(&path)?;
     connection.execute(
         "UPDATE memory3d_schema SET schema_version = ?1 WHERE singleton = 1",
-        params![4],
+        params![8],
     )?;
     drop(connection);
 
@@ -299,8 +375,8 @@ fn newer_schema_is_rejected_without_changing_file_hash() -> TestResult {
     assert!(matches!(
         opened,
         Err(RepositoryError::UnsupportedSchema {
-            found: 4,
-            supported: 3
+            found: 8,
+            supported: 7
         })
     ));
     let after = fs::read(&path)?;
@@ -308,7 +384,7 @@ fn newer_schema_is_rejected_without_changing_file_hash() -> TestResult {
     assert_eq!(after, before);
     let connection = Connection::open(&path)?;
     connection.execute(
-        "UPDATE memory3d_schema SET schema_version = 3 WHERE singleton = 1",
+        "UPDATE memory3d_schema SET schema_version = 7 WHERE singleton = 1",
         [],
     )?;
     drop(connection);

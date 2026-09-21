@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    collections::BTreeMap,
     env,
     error::Error,
     fmt,
@@ -11,10 +12,13 @@ use std::{
 };
 
 use memory3d_core::{
-    ActivationOptions, ActivationReport, Coordinates, DatabaseStats, MAX_HOPS, MAX_METADATA_BYTES,
-    MAX_QUERY_BYTES, MAX_RELATION_NAME_BYTES, MAX_RESULTS, MAX_SEEDS, MAX_TEXT_BYTES,
-    MAX_VISITED_EDGES, MAX_VISITED_NODES, MemoryKind, MemoryNode, Metadata, NewMemory, NewRelation,
-    NodeId, Relation, Repository, SearchOptions, SearchResult, TraversalStats,
+    ActivationOptions, ActivationReport, ApplyAuthorization, Coordinates, DatabaseStats,
+    EvidenceBundle, EvidenceContextItem, EvidenceContextOptions, MAX_BUNDLE_BYTES,
+    MAX_CONTEXT_BYTES, MAX_EVIDENCE_CANDIDATE_SCAN_LIMIT, MAX_EVIDENCE_ID_BYTES, MAX_HOPS,
+    MAX_IDENTITY_BYTES, MAX_METADATA_BYTES, MAX_QUERY_BYTES, MAX_RELATION_NAME_BYTES, MAX_RESULTS,
+    MAX_SEEDS, MAX_TEXT_BYTES, MAX_VISITED_EDGES, MAX_VISITED_NODES, MemoryKind, MemoryNode,
+    Metadata, NewMemory, NewRelation, NodeId, Relation, Repository, SearchOptions, SearchResult,
+    StoredEvidence, TraversalStats,
 };
 use rmcp::{
     Json, ServerHandler, ServiceExt,
@@ -23,9 +27,9 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
-const HELP: &str = "Memory3D MCP stdio server\n\nUsage:\n  memory3d-mcp --db PATH\n  memory3d-mcp -h|--help\n  memory3d-mcp -V|--version\n\nThe server speaks MCP over stdin/stdout and exposes only health, add, link, get, search, and activate tools.\n";
+const HELP: &str = "Memory3D MCP stdio server\n\nUsage:\n  memory3d-mcp --db PATH\n  memory3d-mcp -h|--help\n  memory3d-mcp -V|--version\n\nThe server exposes memory graph tools plus explicit evidence preview, apply, get, context, and rollback tools over stdio.\n";
 const MCP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
 
 type ToolResult<T> = Result<Json<T>, String>;
@@ -191,6 +195,132 @@ impl MemoryServer {
         })
         .map(Json)
     }
+
+    #[tool(
+        description = "Validate a versioned textual evidence bundle and return its deterministic application diff without applying it."
+    )]
+    fn evidence_preview(
+        &self,
+        Parameters(input): Parameters<EvidenceBundleInput>,
+    ) -> ToolResult<Value> {
+        self.with_repository(|repository| {
+            let bundle = EvidenceBundle::from_json(&input.bundle_json)?;
+            let preview = repository.preview_evidence_bundle(&bundle)?;
+            Ok(json!({
+                "status":preview.status.as_str(),
+                "idempotency_key":preview.idempotency_key,
+                "fingerprint":preview.fingerprint,
+                "evidence_ids":preview.evidence_ids,
+                "projected_nodes":preview.projected_nodes,
+                "projected_relations":preview.projected_relations
+            }))
+        })
+        .map(Json)
+    }
+
+    #[tool(
+        description = "Atomically apply one previewable evidence bundle under an explicit actor and policy; identical calls are idempotent."
+    )]
+    fn evidence_apply(
+        &self,
+        Parameters(input): Parameters<EvidenceApplyInput>,
+    ) -> ToolResult<Value> {
+        self.with_repository_mut(|repository| {
+            let bundle = EvidenceBundle::from_json(&input.bundle_json)?;
+            let authorization = ApplyAuthorization::new(input.actor, input.policy)?;
+            let preview = repository.preview_evidence_bundle(&bundle)?;
+            let report = repository.apply_evidence_bundle(&bundle, &authorization)?;
+            Ok(json!({
+                "preview_status":preview.status.as_str(),
+                "bundle_id":report.bundle_id,
+                "idempotency_key":report.idempotency_key,
+                "replayed":report.replayed,
+                "applied_at_ms":report.applied_at_ms,
+                "items":report.items.iter().map(|item|json!({
+                    "evidence_id":item.evidence_id,"node_id":item.node_id.get()
+                })).collect::<Vec<_>>()
+            }))
+        })
+        .map(Json)
+    }
+
+    #[tool(
+        description = "Get one active evidence item with lifecycle, scope, provenance, references, and graph projection."
+    )]
+    fn evidence_get(&self, Parameters(input): Parameters<EvidenceGetInput>) -> ToolResult<Value> {
+        self.with_repository(|repository| {
+            Ok(json!({
+                "evidence":repository.get_evidence_item(&input.evidence_id)?.as_ref().map(stored_evidence_json)
+            }))
+        })
+        .map(Json)
+    }
+
+    #[tool(
+        description = "Assemble conservative exact-scope settled evidence context with admitted/excluded items, conflicts, paths, and bounded work."
+    )]
+    fn evidence_context(
+        &self,
+        Parameters(input): Parameters<EvidenceContextInput>,
+    ) -> ToolResult<Value> {
+        self.with_repository(|repository| {
+            let defaults = ActivationOptions::default();
+            let activation = ActivationOptions {
+                hops: input.hops.unwrap_or(defaults.hops),
+                seed_limit: input.seed_limit.unwrap_or(defaults.seed_limit),
+                limit: input.limit.unwrap_or(defaults.limit),
+                max_visited_nodes: input.max_visited_nodes.unwrap_or(defaults.max_visited_nodes),
+                max_visited_edges: input.max_visited_edges.unwrap_or(defaults.max_visited_edges),
+                include_seeds: true,
+            };
+            let mut options =
+                EvidenceContextOptions::settled(input.scope)?.with_activation(activation);
+            if let Some(candidate_scan_limit) = input.candidate_scan_limit {
+                options = options.with_candidate_scan_limit(candidate_scan_limit);
+            }
+            if let Some(max_bytes) = input.max_bytes {
+                options = options.with_max_bytes(max_bytes)?;
+            }
+            let package = repository.assemble_evidence_context(&input.query, &options)?;
+            Ok(json!({
+                "query":package.query,
+                "scope":package.scope,
+                "abstained":package.abstained,
+                "estimated_text_bytes":package.estimated_text_bytes,
+                "min_relevance_score":package.min_relevance_score,
+                "candidate_work":package.candidate_work,
+                "ordinary_candidates_skipped":package.ordinary_candidates_skipped,
+                "evidence_candidates_evaluated":package.evidence_candidates_evaluated,
+                "candidate_scan_limit":package.candidate_scan_limit,
+                "result_limit":package.result_limit,
+                "stop_reason":package.stop_reason.as_str(),
+                "traversal":{"seeds":package.traversal.seeds,"visited_nodes":package.traversal.visited_nodes,"visited_edges":package.traversal.visited_edges},
+                "database_work":{"seed_queries":package.database.seed_queries,"seed_node_reads":package.database.seed_node_reads,"adjacency_queries":package.database.adjacency_queries,"traversal_node_reads":package.database.traversal_node_reads},
+                "admitted":package.admitted.iter().map(context_item_json).collect::<Vec<_>>(),
+                "excluded":package.excluded.iter().map(context_item_json).collect::<Vec<_>>()
+            }))
+        })
+        .map(Json)
+    }
+
+    #[tool(
+        description = "Explicitly compensate one active evidence bundle; dependencies block rollback and preserve every record."
+    )]
+    fn evidence_rollback(
+        &self,
+        Parameters(input): Parameters<EvidenceRollbackInput>,
+    ) -> ToolResult<Value> {
+        self.with_repository_mut(|repository| {
+            let report = repository.rollback_evidence_bundle(&input.idempotency_key)?;
+            Ok(json!({
+                "idempotency_key":report.idempotency_key,
+                "removed_items":report.removed_items,
+                "removed_nodes":report.removed_nodes,
+                "rolled_back_at_ms":report.rolled_back_at_ms
+            }))
+        })
+        .map(Json)
+    }
 }
 
 #[tool_handler]
@@ -200,7 +330,7 @@ impl ServerHandler for MemoryServer {
             .with_protocol_version(MCP_PROTOCOL_VERSION)
             .with_server_info(Implementation::new("memory3d-mcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Use the configured local Memory3D database through health, add, link, get, search, and activate tools.",
+                "Use graph memory tools or the explicit preview/apply/context/rollback evidence workflow; no tool runs a model or silently applies candidates.",
             )
     }
 }
@@ -275,6 +405,55 @@ struct ActivateInput {
     #[schemars(range(min = 1, max = MAX_VISITED_EDGES))]
     max_visited_edges: Option<usize>,
     include_seeds: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct EvidenceBundleInput {
+    #[schemars(length(min = 1, max = MAX_BUNDLE_BYTES))]
+    bundle_json: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct EvidenceApplyInput {
+    #[schemars(length(min = 1, max = MAX_BUNDLE_BYTES))]
+    bundle_json: String,
+    #[schemars(length(min = 1, max = MAX_IDENTITY_BYTES))]
+    actor: String,
+    #[schemars(length(min = 1, max = MAX_IDENTITY_BYTES))]
+    policy: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct EvidenceGetInput {
+    #[schemars(length(min = 1, max = MAX_EVIDENCE_ID_BYTES))]
+    evidence_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct EvidenceContextInput {
+    #[schemars(length(min = 1, max = MAX_QUERY_BYTES))]
+    query: String,
+    scope: BTreeMap<String, String>,
+    #[schemars(range(min = 0, max = MAX_HOPS))]
+    hops: Option<u8>,
+    #[schemars(range(min = 1, max = MAX_SEEDS))]
+    seed_limit: Option<usize>,
+    #[schemars(range(min = 1, max = MAX_RESULTS))]
+    limit: Option<usize>,
+    #[schemars(range(min = 1, max = MAX_EVIDENCE_CANDIDATE_SCAN_LIMIT))]
+    candidate_scan_limit: Option<usize>,
+    #[schemars(range(min = 1, max = MAX_VISITED_NODES))]
+    max_visited_nodes: Option<usize>,
+    #[schemars(range(min = 1, max = MAX_VISITED_EDGES))]
+    max_visited_edges: Option<usize>,
+    #[schemars(range(min = 1, max = MAX_CONTEXT_BYTES))]
+    max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct EvidenceRollbackInput {
+    #[schemars(length(min = 1, max = MAX_EVIDENCE_ID_BYTES))]
+    idempotency_key: String,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -523,6 +702,47 @@ struct PathStepOutput {
     relation: String,
     weight: f32,
     target: u128,
+}
+
+fn stored_evidence_json(stored: &StoredEvidence) -> Value {
+    let evidence = &stored.evidence;
+    json!({
+        "id":evidence.id(),
+        "node":NodeOutput::from(stored.node.clone()),
+        "kind":evidence.kind().as_str(),
+        "text":evidence.text(),
+        "source":evidence.source(),
+        "producer":evidence.producer(),
+        "scope":evidence.scope(),
+        "lifecycle":evidence.lifecycle().as_str(),
+        "created_at_ms":evidence.created_at_ms(),
+        "observed_at_ms":evidence.observed_at_ms(),
+        "derives_from":evidence.derives_from(),
+        "conflict_group":evidence.conflict_group(),
+        "conflicts_with":evidence.conflicts_with(),
+        "supersedes":evidence.supersedes(),
+        "decision":evidence.decision().map(|decision|json!({
+            "actor":decision.actor(),"policy":decision.policy(),
+            "supporting_evidence_ids":decision.supporting_evidence_ids(),
+            "decided_at_ms":decision.decided_at_ms()
+        })),
+        "bundle_key":stored.bundle_key,
+        "applied_at_ms":stored.applied_at_ms
+    })
+}
+
+fn context_item_json(item: &EvidenceContextItem) -> Value {
+    json!({
+        "evidence":stored_evidence_json(&item.stored),
+        "relevance_score":item.relevance_score,
+        "selection_provenance":item.selection_provenance,
+        "conflicts":item.conflicts,
+        "superseded_by":item.superseded_by,
+        "exclusion":item.exclusion.as_ref().map(memory3d_core::ContextExclusionReason::as_str),
+        "path":{"seed":item.path.seed.get(),"steps":item.path.steps.iter().map(|step|json!({
+            "source":step.source.get(),"relation":step.relation,"weight":step.weight,"target":step.target.get()
+        })).collect::<Vec<_>>()}
+    })
 }
 
 #[tokio::main]
