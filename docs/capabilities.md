@@ -1,21 +1,40 @@
-# Capabilities
+# Capabilities and support levels
 
-Supported public capabilities:
+Support labels in this repository describe public code and deterministic tests. They do not imply
+general domain suitability or product completeness.
 
-- durable plain-text memories, metadata, caller-provided coordinates, and weighted directed links;
-- transactional batches, stable IDs, schema-7 migrations, integrity checks, and safe reopen;
-- deterministic lexical search and bounded explainable graph activation;
-- explicit opt-in relation feedback without raw-weight mutation;
-- CLI, Python, and local stdio MCP adapters for plain memory;
-- evidence preview, transactional apply, immutable lookup, scoped context assembly, idempotency,
-  dependency-aware rollback, and CLI/MCP evidence operations;
-- deterministic offline tests with no model or network dependency.
+| Capability | Level | Core | CLI | Python | MCP |
+| --- | --- | :---: | :---: | :---: | :---: |
+| Plain-text nodes and weighted directed links | Supported/default | ✓ | ✓ | ✓ | ✓ |
+| Node metadata and optional caller-defined coordinates | Supported/default | ✓ | — | ✓ | ✓ |
+| Lexical search and bounded graph activation with scores, work counters, and paths | Supported/default | ✓ | ✓ | ✓ | ✓ |
+| Stable IDs, schema-7 migrations, and nontruncating reopen | Supported/default | ✓ | ✓ | ✓ | ✓ |
+| Explicit database integrity report | Supported/default | ✓ | ✓ | — | — |
+| Evidence preview, apply, immutable lookup, scoped context, and guarded rollback | Supported opt-in | ✓ | ✓ | — | ✓ |
+| Evidence conflict, supersession, provenance, exclusions, scan accounting, and abstention | Supported opt-in | ✓ | ✓ | — | ✓ |
+| Explicit feedback events and feedback-aware activation | Supported opt-in | ✓ | ✓ | — | — |
+| Community artifact construction and community-routed activation | Experimental/core-only | ✓ | — | — | — |
 
-Experimental/core-only capability:
+The evidence workflow is opt-in because callers author the bundle, authorization, scope, and
+policy explicitly; ordinary activation does not silently convert retrieved text into settled
+evidence. Feedback is also opt-in and affects only effective weights for a requested activation.
+Community routing remains experimental, is never the default, and has no promotion claim.
 
-- deterministic community artifact construction and community-routed activation. It is retained to
-  avoid schema and migration divergence, is never selected by default, and is not exposed as a
-  promoted adapter workflow.
+## Rejected or not promoted
 
-Not included in version 0.1.1: embeddings, pruning, spatial retrieval, synthesis, binary payloads,
-automatic extraction, model execution, background lifecycle changes, or a custom storage engine.
+- **Deterministic fan-out synthesis:** implemented and evaluated in the private research lineage,
+  then rejected because the tested mechanism did not improve utility density and reduced useful
+  raw coverage under the same traversal budget. It is not shipped as a production or opt-in API.
+- **Cross-domain promotion of the evidence workflow:** not established. An apparently favorable
+  private evaluation result was rejected after evaluator bias was detected; corrected evidence did
+  not support promotion.
+
+## Intentionally absent or deferred
+
+No public surface provides embeddings, learned ranking, pruning, spatial retrieval, autonomous
+evidence extraction, entity resolution, semantic deduplication, model execution, automatic truth or
+confidence inference, automatic conflict resolution, background lifecycle changes, binary payloads,
+a custom storage engine, or a voice/UI/product layer.
+
+See [limitations](limitations.md) for operational consequences and the
+[verification guide](verification-guide.md) for claim-level evidence.

@@ -1,6 +1,8 @@
 # Architecture decisions
 
 Selected ADR numbers are preserved from the private research authority; gaps are intentional.
+Private Task numbers inside an ADR are historical milestone labels from that lineage, not public
+setup steps or current support levels.
 
 - [ADR 0002](0002-test-scale-aware-associative-growth.md): test scale-aware associative growth.
 - [ADR 0003](0003-order-growth-mechanism-experiments.md): order mechanism experiments.

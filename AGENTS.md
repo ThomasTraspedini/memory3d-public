@@ -1,21 +1,20 @@
 # AGENTS.md
 
-## Authority
+## Public source hierarchy
 
-Use `README.md`, then `docs/architecture.md`, `docs/capabilities.md`, and
-`docs/limitations.md` as the public behavior hierarchy. ADRs and research records explain why the
-current boundary exists; code and deterministic tests are the executable source of truth.
+Use `README.md`, then `docs/architecture.md`, `docs/capabilities.md`, and `docs/limitations.md` as the
+public document hierarchy. `docs/verification-guide.md` maps claims to implementation, tests,
+decisions, demos, research records, and limits. Code and deterministic tests are executable
+evidence; documents are indexes and explanations.
 
-## Verification
+## Change verification
 
 Run `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D
-warnings`, and `cargo test --workspace --all-features` before declaring a change complete. Run
-adapter-specific tests when their setup is available. A future contributor verification guide will
-live at `docs/verification.md`.
+warnings`, and `cargo test --workspace --all-features`. Run an adapter or lifecycle demo when its
+documented command or output changes.
 
-## Boundaries and claims
+## Claim boundaries
 
-Supported and experimental behavior must remain clearly separated. Community routing is
-experimental/core-only. Embeddings, pruning, and spatial retrieval are outside the first public
-release. Claims must be backed by code and deterministic tests. Limitations, rejected findings,
-and incomplete promotion evidence must not be removed or silently upgraded.
+Keep supported, opt-in, experimental, rejected, and absent behavior distinct. Community routing is
+experimental/core-only. Claims must remain backed by public code and tests. Rejected, inconclusive,
+or incomplete findings must not silently become supported claims.

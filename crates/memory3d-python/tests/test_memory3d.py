@@ -277,7 +277,7 @@ def test_python_exceptions_are_typed_and_do_not_dump_stored_text(tmp_path):
 def test_basic_api_surface_in_one_process(tmp_path):
     import memory3d
 
-    assert memory3d.__version__ == "0.1.0"
+    assert memory3d.__version__ == "0.1.1"
     db_path = tmp_path / "api.memory3d"
     with memory3d.Memory(db_path) as memory:
         seed = memory.add_text(

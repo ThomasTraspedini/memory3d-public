@@ -1,60 +1,102 @@
 # Memory lifecycle demo
 
-This two-process demo shows how Memory3D combines durable associative memory with an explicit
-evidence policy. It is a presentation of existing version-1 evidence-envelope and graph-retrieval
-semantics, not a separate inference system.
+This is the shortest concrete explanation of Memory3D. Two CLI processes use one SQLite file to
+show durable ordinary memory, associative retrieval, evidence lifecycle, epistemic filtering, and
+bounded abstention. The fixture is a presentation of public core behavior, not a separate inference
+system.
 
-## Ordinary memory and evidence
+## The two layers
 
-Ordinary memories are plain-text graph nodes connected by weighted directed relations. Retrieval
-selects lexical seeds, follows a bounded number of relations, and returns scores plus
-reconstructable paths.
+**Ordinary memory** is a validated plain-text graph: nodes have kind, text, importance, metadata,
+and optional caller-defined coordinates; weighted directed relations connect them. **Associative
+retrieval** selects lexical seeds, traverses outgoing relations within hop, node, and edge budgets,
+then returns scores and reconstructable paths.
 
-Evidence is also projected into that graph for relevance retrieval, but it carries additional
-immutable records: source and producer identities, exact scope, lifecycle, conflicts,
-supersessions, and decision provenance. Applying evidence requires an explicit actor and policy.
+**Evidence** is projected into that graph so it can be retrieved for relevance, but it also has an
+immutable evidence ID, source and producer identities, exact scope, lifecycle, derivation,
+conflicts, supersessions, and decision provenance. Applying a bundle requires an explicit actor and
+policy.
 
-Relevance answers “what graph material is connected to this query?” Epistemic eligibility answers
-“which relevant evidence may this caller admit under the requested scope and lifecycle policy?” A
-highly relevant item can therefore remain excluded.
+**Epistemic filtering** evaluates retrieved evidence under caller-supplied rules. The settled policy
+used here admits only exact-scope evidence in `observed`, `corroborated`, or `approved` lifecycle
+states, and excludes evidence that is superseded or part of an unresolved conflict. Admitted and
+excluded items are both reported. Relevance answers “what stored material is connected to this
+query?”; eligibility answers “which retrieved evidence may enter this context under this policy?”
 
-## Scenario
+## The humidity scenario
 
-The ingest process creates a bedroom environmental-memory graph and applies three authorized
-evidence bundles. Sensor H-17 first reports persistently high humidity, leading to an inspection
-recommendation. A later calibration finding identifies H-17 as miscalibrated, a calibrated
-instrument reports normal humidity, and routine monitoring supersedes the earlier inspection
-recommendation. A relevant nursery observation has a different exact scope. Two bedroom
-ventilation observations remain in an unresolved conflict.
+The ingest process creates a small home-environment graph and applies three authorized bundles:
 
-The recall process reopens the same SQLite file. Its first query reaches a useful room memory by a
-stored graph relation, admits the calibrated observation and current recommendation, and keeps the
-superseded and scope-mismatched candidates visible with reasons. Its second query sees only the
-conflicting ventilation evidence, excludes both sides, and explicitly abstains.
+1. Sensor H-17 reports persistently high bedroom humidity (`bedroom-high-v1`), and an inspection is
+   recommended (`bedroom-inspect-v1`).
+2. A calibration finding records that H-17 was miscalibrated
+   (`bedroom-sensor-miscalibrated-v1`). A calibrated instrument reports normal bedroom humidity
+   (`bedroom-calibrated-normal-v2`), and routine monitoring (`bedroom-monitor-v2`) supersedes the
+   inspection recommendation. A humidity observation from the nursery (`nursery-high-v1`) remains
+   relevant but has a different exact scope.
+3. Two bedroom ventilation observations (`bedroom-ventilation-open-v1` and
+   `bedroom-ventilation-closed-v1`) explicitly conflict, with no automatic winner.
+
+The recall process reopens the same file. Nothing is inferred about truth, entities, scope, or
+lifecycle: the fixture supplies those records explicitly through the public core API.
 
 ## Run it
 
-From the repository root, use one database path for two separate CLI invocations:
+From the repository root, use a database path that does not already exist:
 
 ```bash
 cargo run -q -p memory3d-cli -- --db /tmp/memory3d-lifecycle.db demo lifecycle ingest
 cargo run -q -p memory3d-cli -- --db /tmp/memory3d-lifecycle.db demo lifecycle recall
 ```
 
-The ingest command refuses to replace a populated database unless `--replace` is supplied. The
-default human output identifies the queries, admitted and excluded evidence, exclusion reasons,
-paths, abstention, traversal work, candidate work, result limits, and stop reasons. Add `--json`
-before `demo` for stable machine-readable output.
+The ingest command refuses to replace a populated database unless `--replace` is supplied. Add
+`--json` before `demo` for stable machine-readable output.
 
-The candidate report is deliberately bounded. `candidate scan: 8/8 inspected` means that this
-fixture's configured scan admitted at most eight ranked candidates; it is not a claim that no
-other evidence exists globally. Traversal reports its independent visited-node and visited-edge
-bounds for the same reason.
+The important part of the human-readable recall output is:
 
-## What this does not demonstrate
+```text
+SETTLED EVIDENCE
+admitted:
+  bedroom-calibrated-normal-v2 lifecycle=observed ...
+  bedroom-monitor-v2 lifecycle=approved ...
+  bedroom-sensor-miscalibrated-v1 lifecycle=approved ...
+excluded:
+  bedroom-inspect-v1 reason=superseded ...
+  bedroom-high-v1 reason=superseded ...
+  nursery-high-v1 reason=scope_mismatch ...
+abstained: false
+candidate scan: 8/8 inspected; evidence=6 ordinary_skipped=2; admitted=3/10; ...
 
-The demo does not infer truth, confidence, scope, entities, conflicts, or lifecycle transitions.
-It does not use embeddings, an LLM, spatial retrieval, background consolidation, autonomous
-ingestion, or automatic resolution. It does not establish global absence or domain-independent
-epistemic safety. Every evidence state, relationship, scope, authorization identity, and decision
-record in the fixture is supplied explicitly through the public core API.
+UNRESOLVED CONFLICT
+admitted:
+  (none)
+excluded:
+  bedroom-ventilation-closed-v1 reason=conflict ...
+  bedroom-ventilation-open-v1 reason=conflict ...
+abstained: true
+candidate scan: 4/4 inspected; evidence=2 ordinary_skipped=2; admitted=0/10; ...
+```
+
+Each printed item also includes its relevance score and path. Superseded evidence remains stored and
+visible rather than being overwritten. Scope mismatch means the evidence selectors do not exactly
+match the requested bedroom scope. Conflict means a visible competing item prevents admission; the
+core does not decide which observation is correct.
+
+Candidate scanning is a separate bound from graph traversal and from the admitted-result limit.
+`candidate scan: 8/8 inspected` means the configured scan examined eight ranked activation
+candidates in this fixture. `abstained: true` means **no evidence was admitted from that bounded
+scan**. Neither statement proves that admissible evidence cannot exist outside the traversal or
+candidate-scan bounds.
+
+## What the demo establishes—and what it does not
+
+The demo provides reproducible evidence for reopen persistence, stable evidence IDs, graph paths,
+exact-scope exclusion, supersession visibility, conflict exclusion, candidate accounting, stop
+reasons, and explicit abstention. Its end-to-end assertions live in
+[`crates/memory3d-cli/tests/demo_e2e.rs`](../crates/memory3d-cli/tests/demo_e2e.rs).
+
+It does not infer truth, confidence, authority, scope, entities, conflicts, or lifecycle
+transitions. It does not use embeddings, an LLM, spatial retrieval, background consolidation,
+autonomous ingestion, or automatic conflict resolution. It does not establish global absence or
+domain-independent epistemic safety. See the [verification guide](verification-guide.md) to follow
+each broader claim into code, tests, decisions, and known limits.

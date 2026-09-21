@@ -1,18 +1,44 @@
-# Limitations
+# Engineering boundaries and limitations
 
-- Lexical retrieval does not provide semantic similarity, learned ranking, or truth assessment.
-- Bounded graph work does not imply constant-time seed lookup or universal latency.
-- Connected low-value edges, hubs, and competing seeds can reduce top-k quality within fixed work
-  budgets.
-- Exact evidence ties end with stable node IDs and can reflect insertion identity across separately
-  constructed databases.
-- Coordinates are stored and validated but have no public spatial-retrieval semantics.
-- Feedback is explicit and opt-in; it is not reinforcement learning or automatic correction.
+These are design and evidence boundaries for the public release, not implied future promises.
+
+## Deployment boundary
+
+- The core is local and synchronous. It does not perform network access or run a model.
+- SQLite is the only backend. The tested operating model is one local writer; multi-writer service
+  operation, encryption, distributed synchronization, and hosted durability are outside scope.
+- The repository is a kernel and adapter set, with no voice, UI, chatbot, hosted service, or end-user
+  product layer.
+
+## Retrieval boundary
+
+- Default seed selection is lexical. It does not provide embedding similarity, learned ranking, or
+  semantic understanding.
+- Hop, result, seed, visited-node, and visited-edge limits bound activation. Bounded work does not
+  imply universal latency, constant-time seed lookup, or exhaustive retrieval.
+- Connected low-value edges, hubs, competing seeds, or material outside the work budget can reduce
+  top-k quality.
+- Exact ties end with stable node IDs. Results are deterministic within a database, but ID assignment
+  can affect exact ties across separately constructed databases.
+- Coordinates are stored and validated in a caller-defined frame; no public spatial-retrieval
+  semantics are implemented.
+- Feedback is explicit and opt-in. It is not reinforcement learning or autonomous correction.
 - Community routing is experimental/core-only and has no promotion claim.
-- Evidence scope matching is exact and caller-defined. The core does not infer authority, resolve
-  conflicts automatically, or convert relevance into confidence.
-- The evidence workflow prevents the recorded scope failure structurally under its contract, but
-  does not establish model-independent or cross-domain epistemic safety.
-- Task 28 remains incomplete for promotion purposes: no cross-domain generalization is claimed.
-- SQLite is evaluated for a local single-writer workflow; multi-writer service operation,
-  encryption, distributed synchronization, and custom payload storage are outside this release.
+
+## Evidence boundary
+
+- Candidate scanning is bounded independently from graph traversal and admitted-result count.
+  Abstention means no item was admitted from the bounded scan, not that admissible evidence is
+  globally absent.
+- Scope matching is exact and caller-authored. The core does not infer or widen scope.
+- The core does not autonomously extract evidence, resolve entities, semantically deduplicate text,
+  infer truth, confidence, or authority, promote lifecycle states, or resolve conflicts.
+- The settled policy filters recorded states and relationships; it cannot determine whether a
+  caller-supplied source, scope, lifecycle, conflict, or decision record is factually correct.
+- The evidence envelope structurally prevents the recorded scope mismatch under its explicit
+  contract. It does not establish a general, model-independent, or cross-domain safety property.
+- The private cross-domain evaluation labeled Task 28 did not establish promotion. That finding is
+  incomplete for promotion purposes and must not be presented as generalization evidence.
+
+See [capabilities](capabilities.md) for surface-level support and the
+[verification guide](verification-guide.md) for the code and tests behind each bounded claim.
