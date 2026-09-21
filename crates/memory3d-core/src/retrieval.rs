@@ -936,7 +936,7 @@ fn feedback_freshness(event: &crate::FeedbackEvent, policy: FeedbackPolicy) -> f
         return 1.0;
     };
     let age = policy.now_ms.saturating_sub(event.occurred_at_ms());
-    let age = u64::try_from(age).map_or(u64::MAX, |value| value);
+    let age = u64::try_from(age).unwrap_or(u64::MAX);
     let half_life = Duration::from_millis(half_life).as_secs_f32();
     let age = Duration::from_millis(age).as_secs_f32();
     half_life / (half_life + age)
