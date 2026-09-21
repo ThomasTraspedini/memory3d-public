@@ -33,7 +33,7 @@ use exceptions::{
 };
 
 /// Optional coordinates stored with a memory node.
-#[pyclass(frozen, get_all, module = "memory3d")]
+#[pyclass(frozen, get_all, module = "memory3d", skip_from_py_object)]
 #[derive(Clone)]
 struct Coordinates {
     x: f64,
@@ -42,7 +42,7 @@ struct Coordinates {
 }
 
 /// Stored text memory returned by the core repository.
-#[pyclass(frozen, module = "memory3d")]
+#[pyclass(frozen, module = "memory3d", skip_from_py_object)]
 #[derive(Clone)]
 struct MemoryNode {
     #[pyo3(get)]
@@ -98,7 +98,13 @@ impl MemoryNode {
 }
 
 /// Directed relation between two memory nodes.
-#[pyclass(frozen, get_all, name = "Relation", module = "memory3d")]
+#[pyclass(
+    frozen,
+    get_all,
+    name = "Relation",
+    module = "memory3d",
+    skip_from_py_object
+)]
 #[derive(Clone)]
 struct PyRelation {
     source: u128,
@@ -136,7 +142,13 @@ impl PyRelation {
 }
 
 /// One lexical search match.
-#[pyclass(frozen, get_all, name = "ActivationReport", module = "memory3d")]
+#[pyclass(
+    frozen,
+    get_all,
+    name = "ActivationReport",
+    module = "memory3d",
+    skip_from_py_object
+)]
 #[derive(Clone)]
 struct SearchResult {
     node: MemoryNode,
@@ -145,7 +157,7 @@ struct SearchResult {
 }
 
 /// One relation step in an activation path.
-#[pyclass(frozen, get_all, module = "memory3d")]
+#[pyclass(frozen, get_all, module = "memory3d", skip_from_py_object)]
 #[derive(Clone)]
 struct PathStep {
     source: u128,
@@ -155,7 +167,7 @@ struct PathStep {
 }
 
 /// Ordered path from lexical seed to activated node.
-#[pyclass(frozen, get_all, module = "memory3d")]
+#[pyclass(frozen, get_all, module = "memory3d", skip_from_py_object)]
 #[derive(Clone)]
 struct ActivationPath {
     seed: u128,
@@ -163,7 +175,7 @@ struct ActivationPath {
 }
 
 /// One ranked activation result.
-#[pyclass(frozen, get_all, module = "memory3d")]
+#[pyclass(frozen, get_all, module = "memory3d", skip_from_py_object)]
 #[derive(Clone)]
 struct ActivationResult {
     node: MemoryNode,
@@ -173,7 +185,7 @@ struct ActivationResult {
 }
 
 /// Work consumed by one activation.
-#[pyclass(frozen, get_all, module = "memory3d")]
+#[pyclass(frozen, get_all, module = "memory3d", skip_from_py_object)]
 #[derive(Clone)]
 struct ActivationStats {
     seeds: usize,
@@ -182,7 +194,7 @@ struct ActivationStats {
 }
 
 /// Database reads issued by one activation.
-#[pyclass(frozen, get_all, module = "memory3d")]
+#[pyclass(frozen, get_all, module = "memory3d", skip_from_py_object)]
 #[derive(Clone)]
 struct ActivationDatabaseStats {
     seed_queries: usize,
@@ -192,7 +204,7 @@ struct ActivationDatabaseStats {
 }
 
 /// Diagnostic wall-clock timings for one activation, in microseconds.
-#[pyclass(frozen, get_all, module = "memory3d")]
+#[pyclass(frozen, get_all, module = "memory3d", skip_from_py_object)]
 #[derive(Clone)]
 struct ActivationTimings {
     seed_lookup_us: u64,
@@ -200,7 +212,7 @@ struct ActivationTimings {
 }
 
 /// Ranked activation results plus traversal counters.
-#[pyclass(frozen, get_all, module = "memory3d")]
+#[pyclass(frozen, get_all, module = "memory3d", skip_from_py_object)]
 #[derive(Clone)]
 struct ActivationReportPy {
     results: Vec<ActivationResult>,
