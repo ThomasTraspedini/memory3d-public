@@ -1,0 +1,12 @@
+/target/
+/.venv/
+/.pytest_cache/
+/.mypy_cache/
+/.ruff_cache/
+__pycache__/
+*.py[cod]
+*.db
+*.db-shm
+*.db-wal
+*.memory3d
+.DS_Store
