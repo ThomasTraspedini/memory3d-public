@@ -5,8 +5,13 @@
 use std::{error::Error, fmt, num::NonZeroU128};
 
 mod repository;
+mod retrieval;
 
-pub use repository::{Repository, RepositoryError};
+pub use repository::{IntegrityReport, Repository, RepositoryError};
+pub use retrieval::{
+    ActivationReport, ActivationTimings, AdjacencyInspection, DatabaseStats, SearchOptions,
+    SearchResult, TraversalStats,
+};
 
 /// Maximum UTF-8 byte length accepted for memory text.
 pub const MAX_TEXT_BYTES: usize = 1_048_576;
@@ -16,6 +21,10 @@ pub const MAX_KIND_BYTES: usize = 64;
 pub const MAX_RELATION_NAME_BYTES: usize = 64;
 /// Maximum encoded JSON byte length accepted for memory metadata.
 pub const MAX_METADATA_BYTES: usize = 65_536;
+/// Maximum UTF-8 byte length accepted for a lexical query.
+pub const MAX_QUERY_BYTES: usize = 4_096;
+/// Maximum number of distinct normalized terms accepted in a lexical query.
+pub const MAX_QUERY_TERMS: usize = 64;
 /// Maximum number of graph hops in an activation request.
 pub const MAX_HOPS: u8 = 16;
 /// Maximum number of lexical seeds in an activation request.
@@ -641,6 +650,16 @@ fn validate_string(
         return Err(ValidationError::TooLong { field, max_bytes });
     }
     Ok(value)
+}
+
+pub(crate) fn normalize_terms(value: &str) -> Vec<String> {
+    let mut terms = std::collections::BTreeSet::new();
+    for token in value.split(|character: char| !character.is_alphanumeric()) {
+        if !token.is_empty() {
+            terms.insert(token.to_lowercase());
+        }
+    }
+    terms.into_iter().collect()
 }
 
 fn validate_unit_interval(value: f32, field: &'static str) -> Result<(), ValidationError> {

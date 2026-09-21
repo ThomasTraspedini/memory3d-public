@@ -2,18 +2,19 @@ use std::{
     error::Error,
     fmt,
     path::{Path, PathBuf},
-    time::{SystemTime, SystemTimeError, UNIX_EPOCH},
+    time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, ffi::ErrorCode, params};
 
 use crate::{
     Coordinates, MAX_RELATION_NAME_BYTES, MemoryKind, MemoryNode, Metadata, NewMemory, NewRelation,
-    NodeId, Relation, ValidationError, validate_string, validate_unit_interval,
+    NodeId, Relation, ValidationError, normalize_terms, validate_string, validate_unit_interval,
 };
 
 const FORMAT_ID: &str = "memory3d";
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 3;
+const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
 const CREATE_SCHEMA_V1: &str = r"
 CREATE TABLE nodes (
@@ -54,6 +55,20 @@ CREATE INDEX relations_source_idx ON relations(source_id, target_id, name);
 CREATE INDEX relations_target_idx ON relations(target_id, source_id, name);
 ";
 
+const CREATE_SCHEMA_V2: &str = r"
+CREATE TABLE node_terms (
+    node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    term TEXT NOT NULL CHECK (length(term) > 0),
+    PRIMARY KEY (node_id, term)
+);
+
+CREATE INDEX node_terms_term_idx ON node_terms(term, node_id);
+";
+
+const CREATE_SCHEMA_V3: &str = r"
+CREATE INDEX relations_adjacency_idx ON relations(source_id, weight DESC);
+";
+
 /// Failures returned by durable repository operations.
 #[derive(Debug)]
 pub enum RepositoryError {
@@ -61,6 +76,8 @@ pub enum RepositoryError {
     Validation(ValidationError),
     /// `SQLite` rejected or could not complete an operation.
     Database(rusqlite::Error),
+    /// Another connection kept the database busy or locked past the bounded wait.
+    Busy,
     /// The database is not a recognized `Memory3D` database.
     InvalidDatabase(String),
     /// The database was created by a newer unsupported schema.
@@ -90,6 +107,9 @@ impl fmt::Display for RepositoryError {
         match self {
             Self::Validation(error) => error.fmt(formatter),
             Self::Database(error) => write!(formatter, "database operation failed: {error}"),
+            Self::Busy => formatter.write_str(
+                "database is busy or locked by another writer; retry after that writer finishes",
+            ),
             Self::InvalidDatabase(reason) => {
                 write!(formatter, "invalid Memory3D database: {reason}")
             }
@@ -119,7 +139,8 @@ impl Error for RepositoryError {
             Self::Validation(error) => Some(error),
             Self::Database(error) => Some(error),
             Self::Clock(error) => Some(error),
-            Self::InvalidDatabase(_)
+            Self::Busy
+            | Self::InvalidDatabase(_)
             | Self::UnsupportedSchema { .. }
             | Self::NodeNotFound(_)
             | Self::RelationNotFound { .. } => None,
@@ -135,7 +156,30 @@ impl From<ValidationError> for RepositoryError {
 
 impl From<rusqlite::Error> for RepositoryError {
     fn from(value: rusqlite::Error) -> Self {
-        Self::Database(value)
+        match value.sqlite_error_code() {
+            Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => Self::Busy,
+            _ => Self::Database(value),
+        }
+    }
+}
+
+/// Result of `SQLite` and application-level checks performed without modifying the database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntegrityReport {
+    messages: Vec<String>,
+}
+
+impl IntegrityReport {
+    /// Returns true when `SQLite` reported no structural or foreign-key problems.
+    #[must_use]
+    pub fn is_ok(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    /// Returns diagnostic messages reported by `SQLite`.
+    #[must_use]
+    pub fn messages(&self) -> &[String] {
+        &self.messages
     }
 }
 
@@ -147,7 +191,7 @@ impl From<SystemTimeError> for RepositoryError {
 
 /// Synchronous repository backed by one versioned `SQLite` file.
 pub struct Repository {
-    connection: Connection,
+    pub(crate) connection: Connection,
     path: PathBuf,
 }
 
@@ -164,6 +208,7 @@ impl Repository {
             return Err(RepositoryError::InvalidDatabase("path is empty".to_owned()));
         }
         let connection = Connection::open(path)?;
+        connection.busy_timeout(BUSY_TIMEOUT)?;
         connection.pragma_update(None, "foreign_keys", true)?;
         let mut repository = Self {
             connection,
@@ -177,6 +222,84 @@ impl Repository {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Checks an existing database through a read-only connection.
+    ///
+    /// This runs `SQLite`'s full integrity check and foreign-key check, then verifies the
+    /// `Memory3D` format identifier and supported schema version. It never creates or migrates a
+    /// database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read as a recognized, supported `Memory3D`
+    /// database. Structural problems that `SQLite` can enumerate are returned in the report.
+    pub fn check(path: impl AsRef<Path>) -> Result<IntegrityReport, RepositoryError> {
+        let path = path.as_ref();
+        if path.as_os_str().is_empty() {
+            return Err(RepositoryError::InvalidDatabase("path is empty".to_owned()));
+        }
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(BUSY_TIMEOUT)?;
+
+        let mut messages = Vec::new();
+        {
+            let mut statement = connection.prepare("PRAGMA integrity_check")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                let message = row?;
+                if message != "ok" {
+                    messages.push(message);
+                }
+            }
+        }
+        {
+            let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
+            let rows = statement.query_map([], |row| {
+                Ok(format!(
+                    "foreign key violation: table={}, rowid={}, parent={}, constraint={}",
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?
+                        .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?
+                ))
+            })?;
+            messages.extend(rows.collect::<Result<Vec<_>, _>>()?);
+        }
+
+        let metadata = connection
+            .query_row(
+                "SELECT format_id, schema_version FROM memory3d_schema WHERE singleton = 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| {
+                RepositoryError::InvalidDatabase(format!("schema metadata is unreadable: {error}"))
+            })?
+            .ok_or_else(|| {
+                RepositoryError::InvalidDatabase("schema metadata is missing".to_owned())
+            })?;
+        if metadata.0 != FORMAT_ID {
+            return Err(RepositoryError::InvalidDatabase(format!(
+                "format identifier is {:?}",
+                metadata.0
+            )));
+        }
+        if metadata.1 > SCHEMA_VERSION {
+            return Err(RepositoryError::UnsupportedSchema {
+                found: metadata.1,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        if !(0..=SCHEMA_VERSION).contains(&metadata.1) {
+            return Err(RepositoryError::InvalidDatabase(format!(
+                "unsupported historical schema version {}",
+                metadata.1
+            )));
+        }
+        Ok(IntegrityReport { messages })
     }
 
     /// Adds one node and returns its complete durable representation.
@@ -210,6 +333,7 @@ impl Repository {
                 params![node.kind.as_str(), node.text, metadata, node.importance, now, x, y, z],
             )?;
             let id = id_from_i64(transaction.last_insert_rowid())?;
+            index_node_terms(&transaction, id, node.kind.as_str(), &node.text)?;
             stored.push(MemoryNode::from_stored(id, node.clone(), now, now));
         }
         transaction.commit()?;
@@ -378,6 +502,8 @@ impl Repository {
                 params![FORMAT_ID, unix_time_ms()?],
             )?;
             migrate_v0_to_v1(&transaction)?;
+            migrate_v1_to_v2(&transaction)?;
+            migrate_v2_to_v3(&transaction)?;
             transaction.commit()?;
             return Ok(());
         }
@@ -402,6 +528,21 @@ impl Repository {
             0 => {
                 let transaction = self.connection.transaction()?;
                 migrate_v0_to_v1(&transaction)?;
+                migrate_v1_to_v2(&transaction)?;
+                migrate_v2_to_v3(&transaction)?;
+                transaction.commit()?;
+                Ok(())
+            }
+            1 => {
+                let transaction = self.connection.transaction()?;
+                migrate_v1_to_v2(&transaction)?;
+                migrate_v2_to_v3(&transaction)?;
+                transaction.commit()?;
+                Ok(())
+            }
+            2 => {
+                let transaction = self.connection.transaction()?;
+                migrate_v2_to_v3(&transaction)?;
                 transaction.commit()?;
                 Ok(())
             }
@@ -413,11 +554,62 @@ impl Repository {
     }
 }
 
+fn migrate_v1_to_v2(transaction: &Transaction<'_>) -> Result<(), RepositoryError> {
+    transaction.execute_batch(CREATE_SCHEMA_V2)?;
+    let nodes = {
+        let mut statement = transaction.prepare("SELECT id, kind, text FROM nodes ORDER BY id")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (id, kind, text) in nodes {
+        index_node_terms(transaction, id_from_i64(id)?, &kind, &text)?;
+    }
+    transaction.execute(
+        "UPDATE memory3d_schema SET schema_version = ?1 WHERE singleton = 1 AND schema_version = 1",
+        [2],
+    )?;
+    Ok(())
+}
+
+fn migrate_v2_to_v3(transaction: &Transaction<'_>) -> Result<(), RepositoryError> {
+    transaction.execute_batch(CREATE_SCHEMA_V3)?;
+    transaction.execute(
+        "UPDATE memory3d_schema SET schema_version = 3 WHERE singleton = 1 AND schema_version = 2",
+        [],
+    )?;
+    Ok(())
+}
+
+fn index_node_terms(
+    transaction: &Transaction<'_>,
+    id: NodeId,
+    kind: &str,
+    text: &str,
+) -> Result<(), RepositoryError> {
+    let mut terms = normalize_terms(kind);
+    terms.extend(normalize_terms(text));
+    terms.sort_unstable();
+    terms.dedup();
+    for term in terms {
+        transaction.execute(
+            "INSERT INTO node_terms (node_id, term) VALUES (?1, ?2)",
+            params![id_to_i64(id)?, term],
+        )?;
+    }
+    Ok(())
+}
+
 fn migrate_v0_to_v1(transaction: &Transaction<'_>) -> Result<(), RepositoryError> {
     transaction.execute_batch(CREATE_SCHEMA_V1)?;
     transaction.execute(
         "UPDATE memory3d_schema SET schema_version = ?1 WHERE singleton = 1 AND schema_version = 0",
-        [SCHEMA_VERSION],
+        [1],
     )?;
     Ok(())
 }
@@ -429,13 +621,13 @@ fn unix_time_ms() -> Result<i64, RepositoryError> {
     })
 }
 
-fn id_to_i64(id: NodeId) -> Result<i64, RepositoryError> {
+pub(crate) fn id_to_i64(id: NodeId) -> Result<i64, RepositoryError> {
     i64::try_from(id.get()).map_err(|_| {
         RepositoryError::InvalidDatabase(format!("node ID {id} exceeds the storage range"))
     })
 }
 
-fn id_from_i64(value: i64) -> Result<NodeId, RepositoryError> {
+pub(crate) fn id_from_i64(value: i64) -> Result<NodeId, RepositoryError> {
     let value = u128::try_from(value).map_err(|_| {
         RepositoryError::InvalidDatabase(format!("stored node ID {value} is invalid"))
     })?;
@@ -518,7 +710,7 @@ fn decode_node(raw: RawNode) -> Result<MemoryNode, RepositoryError> {
 
 type RawRelation = (i64, i64, String, f32, i64, i64, i64);
 
-fn read_relation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRelation> {
+pub(crate) fn read_relation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRelation> {
     Ok((
         row.get(0)?,
         row.get(1)?,
@@ -530,7 +722,7 @@ fn read_relation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRelation> {
     ))
 }
 
-fn decode_relation(raw: RawRelation) -> Result<Relation, RepositoryError> {
+pub(crate) fn decode_relation(raw: RawRelation) -> Result<Relation, RepositoryError> {
     let (source, target, name, weight, created, updated, reinforcement) = raw;
     let new = NewRelation::new(id_from_i64(source)?, id_from_i64(target)?, name, weight)?;
     if created < 0 || updated < created || reinforcement < 0 {

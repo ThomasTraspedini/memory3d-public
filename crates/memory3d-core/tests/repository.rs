@@ -37,7 +37,7 @@ fn creates_empty_versioned_database() -> TestResult {
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    assert_eq!(metadata, ("memory3d".to_owned(), 1));
+    assert_eq!(metadata, ("memory3d".to_owned(), 3));
     Ok(())
 }
 
@@ -110,17 +110,92 @@ fn relations_require_existing_nodes_and_round_trip_updates() -> TestResult {
 fn relation_batch_rolls_back_on_conflict() -> TestResult {
     let directory = tempdir()?;
     let path = directory.path().join("transaction.memory3d");
-    let mut repository = Repository::open(path)?;
+    let mut repository = Repository::open(&path)?;
     let source = repository.add_node(memory("source")?)?;
     let target = repository.add_node(memory("target")?)?;
-    let duplicate = NewRelation::new(source.id(), target.id(), "depends_on", 0.8)?;
+    let other = repository.add_node(memory("other target")?)?;
+    let committed =
+        repository.add_relation(NewRelation::new(source.id(), target.id(), "owns", 0.9)?)?;
+    let duplicate = NewRelation::new(source.id(), other.id(), "depends_on", 0.8)?;
 
     assert!(
         repository
             .add_relations(&[duplicate.clone(), duplicate])
             .is_err()
     );
-    assert!(repository.list_relations()?.is_empty());
+    assert_eq!(repository.list_relations()?, vec![committed.clone()]);
+    drop(repository);
+    let reopened = Repository::open(path)?;
+    assert_eq!(reopened.list_relations()?, vec![committed]);
+    Ok(())
+}
+
+#[test]
+fn node_batch_rolls_back_and_preserves_committed_data() -> TestResult {
+    let directory = tempdir()?;
+    let path = directory.path().join("node-rollback.memory3d");
+    let committed = {
+        let mut repository = Repository::open(&path)?;
+        repository.add_node(memory("committed before failed batch")?)?
+    };
+    let connection = Connection::open(&path)?;
+    connection.execute_batch(
+        "CREATE TRIGGER reject_test_node BEFORE INSERT ON nodes WHEN NEW.text = 'reject me' BEGIN SELECT RAISE(ABORT, 'injected test failure'); END;",
+    )?;
+    drop(connection);
+
+    let mut repository = Repository::open(&path)?;
+    let failed = repository.add_nodes(&[memory("first uncommitted node")?, memory("reject me")?]);
+    assert!(failed.is_err());
+    assert_eq!(repository.list_nodes()?, vec![committed.clone()]);
+    drop(repository);
+
+    let reopened = Repository::open(path)?;
+    assert_eq!(reopened.list_nodes()?, vec![committed]);
+    Ok(())
+}
+
+#[test]
+fn competing_writer_gets_typed_busy_error_and_committed_data_survives() -> TestResult {
+    let directory = tempdir()?;
+    let path = directory.path().join("busy.memory3d");
+    let committed = {
+        let mut repository = Repository::open(&path)?;
+        repository.add_node(memory("committed before lock")?)?
+    };
+    let blocker = Connection::open(&path)?;
+    blocker.execute_batch("BEGIN IMMEDIATE")?;
+
+    let mut competing = Repository::open(&path)?;
+    let error = competing.add_node(memory("blocked write")?);
+    assert!(matches!(&error, Err(RepositoryError::Busy)));
+    assert!(
+        error
+            .err()
+            .is_some_and(|value| value.to_string().contains("busy or locked"))
+    );
+    drop(competing);
+    blocker.execute_batch("ROLLBACK")?;
+    drop(blocker);
+
+    let reopened = Repository::open(path)?;
+    assert_eq!(reopened.list_nodes()?, vec![committed]);
+    Ok(())
+}
+
+#[test]
+fn integrity_check_is_read_only_and_accepts_valid_database() -> TestResult {
+    let directory = tempdir()?;
+    let path = directory.path().join("integrity.memory3d");
+    let mut repository = Repository::open(&path)?;
+    repository.add_node(memory("durable integrity fixture")?)?;
+    drop(repository);
+
+    let before = fs::read(&path)?;
+    let report = Repository::check(&path)?;
+    assert!(report.is_ok());
+    assert!(report.messages().is_empty());
+    assert_eq!(fs::read(path)?, before);
     Ok(())
 }
 
@@ -170,7 +245,36 @@ fn migrates_version_zero_transactionally() -> TestResult {
         [],
         |row| row.get(0),
     )?;
-    assert_eq!(version, 1);
+    assert_eq!(version, 3);
+    Ok(())
+}
+
+#[test]
+fn migrates_version_two_with_adjacency_index() -> TestResult {
+    let directory = tempdir()?;
+    let path = directory.path().join("adjacency-migration.memory3d");
+    drop(Repository::open(&path)?);
+    let connection = Connection::open(&path)?;
+    connection.execute_batch(
+        "DROP INDEX relations_adjacency_idx;
+         UPDATE memory3d_schema SET schema_version = 2 WHERE singleton = 1;",
+    )?;
+    drop(connection);
+
+    drop(Repository::open(&path)?);
+    let connection = Connection::open(path)?;
+    let version: i64 = connection.query_row(
+        "SELECT schema_version FROM memory3d_schema WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let index_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'relations_adjacency_idx')",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(version, 3);
+    assert!(index_exists);
     Ok(())
 }
 
@@ -178,11 +282,14 @@ fn migrates_version_zero_transactionally() -> TestResult {
 fn newer_schema_is_rejected_without_changing_file_hash() -> TestResult {
     let directory = tempdir()?;
     let path = directory.path().join("future.memory3d");
-    drop(Repository::open(&path)?);
+    let committed = {
+        let mut repository = Repository::open(&path)?;
+        repository.add_node(memory("committed before future schema marker")?)?
+    };
     let connection = Connection::open(&path)?;
     connection.execute(
         "UPDATE memory3d_schema SET schema_version = ?1 WHERE singleton = 1",
-        params![2],
+        params![4],
     )?;
     drop(connection);
 
@@ -192,13 +299,21 @@ fn newer_schema_is_rejected_without_changing_file_hash() -> TestResult {
     assert!(matches!(
         opened,
         Err(RepositoryError::UnsupportedSchema {
-            found: 2,
-            supported: 1
+            found: 4,
+            supported: 3
         })
     ));
-    let after = fs::read(path)?;
+    let after = fs::read(&path)?;
     assert_eq!(hash(&after), before_hash);
     assert_eq!(after, before);
+    let connection = Connection::open(&path)?;
+    connection.execute(
+        "UPDATE memory3d_schema SET schema_version = 3 WHERE singleton = 1",
+        [],
+    )?;
+    drop(connection);
+    let reopened = Repository::open(path)?;
+    assert_eq!(reopened.list_nodes()?, vec![committed]);
     Ok(())
 }
 
