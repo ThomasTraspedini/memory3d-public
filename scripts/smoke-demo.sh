@@ -108,7 +108,7 @@ run_python_demo() {
   local database="$work/python-codebase.memory3d"
   python3 -m venv "$work/venv"
   "$work/venv/bin/python" -m pip install --upgrade pip
-  "$work/venv/bin/python" -m pip install 'maturin>=1.7,<2' pytest
+  "$work/venv/bin/python" -m pip install "$root/crates/memory3d-python[dev]"
   VIRTUAL_ENV="$work/venv" PATH="$work/venv/bin:$PATH" "$work/venv/bin/python" \
     -m maturin develop --manifest-path crates/memory3d-python/Cargo.toml
   "$work/venv/bin/python" -m pytest crates/memory3d-python/tests

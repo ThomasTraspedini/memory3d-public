@@ -323,6 +323,7 @@ impl MemoryServer {
     }
 }
 
+#[allow(clippy::unused_async_trait_impl)]
 #[tool_handler]
 impl ServerHandler for MemoryServer {
     fn get_info(&self) -> ServerInfo {
