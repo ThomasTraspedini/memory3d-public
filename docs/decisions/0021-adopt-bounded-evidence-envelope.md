@@ -79,7 +79,7 @@ Schema and public API complexity increase, and callers must provide explicit sco
 policy. In return, the exact Task 25 failure can be prevented structurally and audited without
 hiding raw evidence. Existing memories and plain activation remain unchanged and deterministic.
 
-Task 27 must still prove migrations, reopen, adapter parity, atomic failure, idempotency, rollback,
-and the frozen parameter-selection regression before this task is complete. Task 28 alone decides
-whether the unchanged workflow generalizes or earns broader support; this ADR makes no H7 or
-cross-domain promotion claim.
+The implementation subsequently proved migrations, reopen, adapter parity, atomic failure,
+idempotency, rollback, and the bounded parameter-selection regression. The later cross-domain
+evaluation did not establish promotion, so this ADR makes no H7 or cross-domain generalization
+claim.
