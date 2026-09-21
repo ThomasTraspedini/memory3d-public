@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/memory3d-core"]
+members = [
+    "crates/memory3d-core",
+    "crates/memory3d-cli",
+    "crates/memory3d-python",
+    "crates/memory3d-mcp",
+]
 
 [workspace.package]
 version = "0.1.0"

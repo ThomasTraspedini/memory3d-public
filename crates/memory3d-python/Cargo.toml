@@ -1,0 +1,20 @@
+[package]
+name = "memory3d-python"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Python adapter for Memory3D"
+license = "MIT"
+
+[lib]
+name = "memory3d"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+memory3d-core = { path = "../memory3d-core" }
+pyo3 = { version = "0.24.2", features = ["extension-module"] }
+serde_json = "1.0.145"
+
+[lints]
+workspace = true
