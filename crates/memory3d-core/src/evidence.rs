@@ -129,7 +129,7 @@ pub enum EvidenceLifecycle {
     Observed,
     /// Evidence accepted as independently supported by a declared policy.
     Corroborated,
-    /// Evidence accepted for a declared scope by an authorized decision.
+    /// Evidence accepted for a declared scope by a recorded caller decision.
     Approved,
     /// Evidence explicitly contradicted without deleting either side.
     Contradicted,
@@ -391,7 +391,10 @@ impl EvidenceBundle {
     }
 }
 
-/// Explicit authorization required by transactional bundle application.
+/// Caller-supplied actor and policy metadata required by transactional bundle application.
+///
+/// Construction validates the identifiers; it does not authenticate the actor or enforce an
+/// external authorization policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyAuthorization {
     actor: String,
@@ -1063,7 +1066,8 @@ impl Repository {
         Ok(bundle_preview(bundle, BundlePreviewStatus::New))
     }
 
-    /// Applies a previewed bundle atomically under explicit operator or policy authorization.
+    /// Applies a previewed bundle atomically and records explicit caller-supplied actor/policy
+    /// metadata.
     ///
     /// Identical active replays return the original durable mapping. Reusing a key for another
     /// payload, reusing an evidence ID, or failing any reference rolls back the whole transaction.

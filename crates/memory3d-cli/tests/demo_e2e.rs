@@ -295,7 +295,7 @@ fn lifecycle_demo_reopens_with_paths_exclusions_conflict_abstention_and_bounds()
         "admitted:",
         "excluded:",
         "reason=superseded",
-        "reason=scope_mismatch",
+        "reason=scope_mismatch requested={\"home\":\"demo-home\",\"room\":\"bedroom\"} candidate={\"home\":\"demo-home\",\"room\":\"nursery\"}",
         "reason=conflict",
         "abstained: true",
         "candidate scan:",

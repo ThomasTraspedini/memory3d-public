@@ -25,7 +25,8 @@ query?”; eligibility answers “which retrieved evidence may enter this contex
 
 ## The humidity scenario
 
-The ingest process creates a small home-environment graph and applies three authorized bundles:
+The ingest process creates a small home-environment graph and applies three bundles with explicit,
+caller-supplied actor and policy metadata:
 
 1. Sensor H-17 reports persistently high bedroom humidity (`bedroom-high-v1`), and an inspection is
    recommended (`bedroom-inspect-v1`).
@@ -55,7 +56,7 @@ The ingest command refuses to replace a populated database unless `--replace` is
 The important part of the human-readable recall output is:
 
 ```text
-SETTLED EVIDENCE
+EVIDENCE ADMITTED BY SETTLED POLICY
 admitted:
   bedroom-calibrated-normal-v2 lifecycle=observed ...
   bedroom-monitor-v2 lifecycle=approved ...
@@ -63,7 +64,7 @@ admitted:
 excluded:
   bedroom-inspect-v1 reason=superseded ...
   bedroom-high-v1 reason=superseded ...
-  nursery-high-v1 reason=scope_mismatch ...
+  nursery-high-v1 reason=scope_mismatch requested={"home":"demo-home","room":"bedroom"} candidate={"home":"demo-home","room":"nursery"} ...
 abstained: false
 candidate scan: 8/8 inspected; evidence=6 ordinary_skipped=2; admitted=3/10; ...
 

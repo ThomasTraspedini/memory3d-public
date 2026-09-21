@@ -8,9 +8,9 @@ evidence enters a context package. It is a kernel and research artifact—not a 
 product, vector database, complete autonomous memory manager, voice companion, or claim to solve
 general machine memory.
 
-> This document is an index to evidence, not evidence itself. Check claims against the
-> implementation, deterministic tests, architecture decisions, and reproducible demos. Report
-> contradictions rather than resolving them optimistically.
+> This document is an index to evidence, not evidence itself. Public claims are linked to the
+> implementation, deterministic tests, architecture decisions, reproducible demos, and known
+> limitations.
 
 ## The central idea
 
@@ -30,9 +30,10 @@ observation projected into that same graph for relevance, plus source, producer,
 lifecycle, derivation, conflict, supersession, and decision records. An **admitted** item passed the
 requested policy and bounds; an **excluded** item remains visible with the reason it did not pass.
 
-The project grew from an exploration of persistent memory for an agent operating over time in a
-physical/home environment. The public smart-home fixture keeps that motivation concrete without
-turning this repository into a smart-home product or a complete embodied-agent system.
+The name comes from the project's original exploration of persistent memory for an agent operating
+in a physical/environmental context; spatial retrieval is not a supported capability in this public
+release. The public smart-home fixture keeps that motivation concrete without turning this
+repository into a smart-home product or a complete embodied-agent system.
 
 ## See the lifecycle in two processes
 
@@ -48,9 +49,10 @@ same SQLite file and prints three views:
 
 - **Associative retrieval** reaches a room memory through a stored `connects_to` relation and shows
   its score, path, and traversal work.
-- **Settled evidence** admits `bedroom-calibrated-normal-v2`, `bedroom-monitor-v2`, and
-  `bedroom-sensor-miscalibrated-v1`. It excludes `bedroom-inspect-v1` and `bedroom-high-v1` as
-  superseded, and `nursery-high-v1` because its exact room scope does not match.
+- **Evidence admitted by the settled policy** includes `bedroom-calibrated-normal-v2`,
+  `bedroom-monitor-v2`, and `bedroom-sensor-miscalibrated-v1`. It excludes
+  `bedroom-inspect-v1` and `bedroom-high-v1` as superseded, and `nursery-high-v1` because its exact
+  room scope does not match.
 - **Unresolved conflict** keeps both ventilation observations visible, admits neither, and returns
   `abstained: true`.
 

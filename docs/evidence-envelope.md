@@ -21,6 +21,9 @@ The workflow is:
 4. assemble scoped context through bounded lexical and graph activation;
 5. roll back an applied bundle only when no later durable evidence depends on it.
 
+The actor and policy fields are caller-supplied metadata. The core validates and records them; it
+does not authenticate actors, evaluate identity, or enforce an external authorization policy.
+
 Identical idempotent replays return the prior result. Reusing a key for a different canonical
 payload fails. Rollback is a compensating transaction and cannot erase evidence referenced by a
 later bundle.

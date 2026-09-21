@@ -33,8 +33,8 @@ These are design and evidence boundaries for the public release, not implied fut
 - Scope matching is exact and caller-authored. The core does not infer or widen scope.
 - The core does not autonomously extract evidence, resolve entities, semantically deduplicate text,
   infer truth, confidence, or authority, promote lifecycle states, or resolve conflicts.
-- The settled policy filters recorded states and relationships; it cannot determine whether a
-  caller-supplied source, scope, lifecycle, conflict, or decision record is factually correct.
+- The settled policy filters recorded states and relationships; it cannot determine whether
+  caller-supplied metadata or evidence content is factually correct.
 - The evidence envelope structurally prevents the recorded scope mismatch under its explicit
   contract. It does not establish a general, model-independent, or cross-domain safety property.
 - The private cross-domain evaluation labeled Task 28 did not establish promotion. That finding is

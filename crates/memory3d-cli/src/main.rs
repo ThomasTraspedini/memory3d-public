@@ -910,7 +910,7 @@ fn print_output(value: &Value, json_mode: bool) -> Result<(), Box<dyn Error>> {
 fn human_output(value: &Value) -> String {
     match value.get("command").and_then(Value::as_str) {
         Some("demo lifecycle ingest") => format!(
-            "Memory3D lifecycle ingest\nDatabase: {}\nPersisted: {} nodes, {} relations\nEvidence: {} items in {} authorized bundles\nAuthorization: actor={} policy={}\nNext: reopen this database in a separate process with `demo lifecycle recall`",
+            "Memory3D lifecycle ingest\nDatabase: {}\nPersisted: {} nodes, {} relations\nEvidence: {} items in {} bundles\nRecorded apply metadata: actor={} policy={}\nNext: reopen this database in a separate process with `demo lifecycle recall`",
             value["database"].as_str().unwrap_or("?"),
             value["node_count"],
             value["relation_count"],
@@ -1005,7 +1005,7 @@ fn lifecycle_recall_human(value: &Value) -> String {
             associative["bounds"]["max_visited_edges"]
         ),
         String::new(),
-        "SETTLED EVIDENCE".to_owned(),
+        "EVIDENCE ADMITTED BY SETTLED POLICY".to_owned(),
     ];
     append_context_human(&mut lines, &value["settled_context"]);
     lines.push(String::new());
@@ -1020,9 +1020,9 @@ fn append_context_human(lines: &mut Vec<String>, context: &Value) {
         context["query"].as_str().unwrap_or("?")
     ));
     lines.push("admitted:".to_owned());
-    append_evidence_items(lines, &context["admitted"], false);
+    append_evidence_items(lines, &context["admitted"], &context["scope"], false);
     lines.push("excluded:".to_owned());
-    append_evidence_items(lines, &context["excluded"], true);
+    append_evidence_items(lines, &context["excluded"], &context["scope"], true);
     lines.push(format!("abstained: {}", context["abstained"]));
     lines.push(format!(
         "candidate scan: {}/{} inspected; evidence={} ordinary_skipped={}; admitted={}/{}; stop={}",
@@ -1036,7 +1036,12 @@ fn append_context_human(lines: &mut Vec<String>, context: &Value) {
     ));
 }
 
-fn append_evidence_items(lines: &mut Vec<String>, items: &Value, show_exclusion: bool) {
+fn append_evidence_items(
+    lines: &mut Vec<String>,
+    items: &Value,
+    requested_scope: &Value,
+    show_exclusion: bool,
+) {
     let Some(items) = items.as_array() else {
         lines.push("  (none)".to_owned());
         return;
@@ -1047,9 +1052,18 @@ fn append_evidence_items(lines: &mut Vec<String>, items: &Value, show_exclusion:
     for item in items {
         let evidence = &item["evidence"];
         let status = if show_exclusion {
+            let scope_details = if item["exclusion"] == "scope_mismatch" {
+                format!(
+                    " requested={} candidate={}",
+                    requested_scope, evidence["scope"]
+                )
+            } else {
+                String::new()
+            };
             format!(
-                " reason={}{}{}",
+                " reason={}{}{}{}",
                 item["exclusion"].as_str().unwrap_or("?"),
+                scope_details,
                 list_suffix(" superseded_by=", &item["superseded_by"]),
                 list_suffix(" conflicts=", &item["conflicts"])
             )

@@ -1,6 +1,6 @@
 # Architecture decisions
 
-Selected ADR numbers are preserved from the private research authority; gaps are intentional.
+Selected ADR numbers are preserved from the private research lineage; gaps are intentional.
 Private Task numbers inside an ADR are historical milestone labels from that lineage, not public
 setup steps or current support levels.
 

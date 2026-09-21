@@ -257,7 +257,7 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Assemble conservative exact-scope settled evidence context with admitted/excluded items, conflicts, paths, and bounded work."
+        description = "Assemble evidence context under the conservative exact-scope `settled` policy, with admitted/excluded items, conflicts, paths, and bounded work."
     )]
     fn evidence_context(
         &self,

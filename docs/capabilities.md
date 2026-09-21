@@ -15,9 +15,11 @@ general domain suitability or product completeness.
 | Explicit feedback events and feedback-aware activation | Supported opt-in | ✓ | ✓ | — | — |
 | Community artifact construction and community-routed activation | Experimental/core-only | ✓ | — | — | — |
 
-The evidence workflow is opt-in because callers author the bundle, authorization, scope, and
-policy explicitly; ordinary activation does not silently convert retrieved text into settled
-evidence. Feedback is also opt-in and affects only effective weights for a requested activation.
+The evidence workflow is opt-in because callers author the bundle, actor/policy metadata, scope,
+and context policy explicitly; the core records and validates that metadata but does not
+authenticate actors or enforce an external authorization policy. Ordinary activation does not
+silently admit retrieved text under an evidence policy. Feedback is also opt-in and affects only
+effective weights for a requested activation.
 Community routing remains experimental, is never the default, and has no promotion claim.
 
 ## Rejected or not promoted
